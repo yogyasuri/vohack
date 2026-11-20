@@ -1,149 +1,62 @@
-<p align="center">
-  <a href="https://0.security/">
-    <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="assets/readme/header-dark.svg">
-      <img src="assets/readme/header-light.svg" alt="0security" width="900">
-    </picture>
-  </a>
-</p>
+<h1 align="center">Voyege</h1>
 
-<h1 align="center">Voyege · Travel Security &amp; Fraud Shield</h1>
+<p align="center"><b>Agentic real-time security &amp; fraud shield for online booking &amp; travel platforms.</b></p>
 
 <p align="center">
-  Voyege re-checks a B2B travel platform after every change, catches broken money and access rules,
-  watches logs for fraud in progress, and sends a verified, ₹-ranked ticket to the right team.
-  It is built on the open-source <a href="https://github.com/0sec-labs/0security">0security</a> agent foundation (MIT / Apache-2.0).
+  Voyege re-checks your platform on every change, catches broken money and access rules, watches logs for
+  fraud in progress, and sends a verified, ₹-ranked ticket to the right team — then retests after the fix.
+  It finds the business-logic flaws that ordinary scanners structurally cannot see.
 </p>
-
-<p align="center"><b>Start here:</b> <a href="shield/README.md"><code>shield/</code></a> · run <code>shield/run.sh</code> and open http://127.0.0.1:8800</p>
 
 ---
-
-<sub>The rest of this README describes the upstream 0security foundation that Voyege builds on.</sub>
-
-
-<p align="center">
-  <sub>By the Swiss Applied AI &amp; Cybersecurity Research Lab</sub>
-</p>
-
-<p align="center">
-  <sub>Backed by</sub>
-  <a href="https://www.ycombinator.com/companies/0security"><img src="assets/readme/y-combinator.png" alt="Y Combinator" width="116" height="24" align="middle"></a>
-</p>
-
-<p align="center">
-  <a href="https://github.com/0sec-labs/0security/releases/latest"><img src="https://img.shields.io/github/v/release/0sec-labs/0security" alt="Latest release"></a>
-  <a href="LICENSE-MIT"><img src="https://img.shields.io/badge/license-MIT%20%7C%20Apache--2.0-blue" alt="MIT or Apache-2.0 license"></a>
-  <a href="https://github.com/0sec-labs/0security/stargazers"><img src="https://img.shields.io/github/stars/0sec-labs/0security?style=flat" alt="GitHub stars"></a>
-</p>
-
-<p align="center">
-  0security is software infrastructure to deploy sovereign, persistent AI security agents that find and fix security risks across any tech stack, work with any model, and run anywhere.
-</p>
-
-<p align="center">
-  <a href="https://docs.0.security/"><picture><source media="(prefers-color-scheme: dark)" srcset="assets/readme/nav-docs-dark.svg"><img src="assets/readme/nav-docs-light.svg" alt="Documentation" height="48"></picture></a>
-  <a href="https://0.security/research/"><picture><source media="(prefers-color-scheme: dark)" srcset="assets/readme/nav-research-dark.svg"><img src="assets/readme/nav-research-light.svg" alt="Security research" height="48"></picture></a>
-  <a href="#quick-start"><picture><source media="(prefers-color-scheme: dark)" srcset="assets/readme/nav-install-dark.svg"><img src="assets/readme/nav-install-light.svg" alt="Install locally" height="48"></picture></a>
-  <a href="https://0.security/enterprise/"><picture><source media="(prefers-color-scheme: dark)" srcset="assets/readme/enterprise-button-dark.svg"><img src="assets/readme/enterprise-button-light.svg" alt="Enterprise" height="48"></picture></a>
-</p>
-
-<p align="center">
-  <a href="assets/readme-ui-demo.mp4">
-    <picture>
-      <img src="assets/readme-ui-demo.gif" alt="0 web UI: review a demo API, watch the investigation, then open findings with suggested fixes and verification" width="100%">
-    </picture>
-  </a>
-</p>
 
 ## Quick start
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/0sec-labs/0security/main/install.sh | bash
-0
+cd shield
+./run.sh                                   # dashboard → http://127.0.0.1:8800
 ```
 
-Prefer the terminal?
+Open the landing page, read what Voyege is, then enter a URL for an instant **read-only** posture scan —
+TLS, security headers, cookies, version disclosure, CORS, and the API routes hidden in your front-end code.
+From there, **Explore the live dashboard** to see the full change → detect → verify → ticket → retest loop
+running on a built-in demo platform.
 
 ```bash
-export OPENAI_API_KEY="your-api-key"
-0 scan ./your-repo
-0 findings list
+cd shield
+python3 -m voyege_shield.cli https://your-site.com -y   # same scan from the terminal (read-only)
+python3 -m pytest -q tests                              # test suite
 ```
 
-`0 scan` takes a folder or a git URL, prints a report (`--format json|md|sarif|html|pdf`) and stops at `--budget` (default $5).
+## What's inside
 
-Any supported provider works: set its key instead (Anthropic, OpenRouter, DeepSeek and more, see [Models](https://docs.0.security/models/)), or connect one in the browser with `0`.
+| Capability | Where |
+|---|---|
+| Safety gate (scope allowlist, rate limits, back-off, kill switch, evidence minimisation) | `shield/voyege_shield/gate.py` |
+| Hash-chained flight recorder (write-before-forward) | `shield/voyege_shield/recorder.py` |
+| Discovery &amp; inventory — active / zombie / shadow labels, OpenAPI 3.1 export | `shield/voyege_shield/inventory.py` |
+| Change detector — signed webhook, bundle / shape / log diff, DNS/CT watch | `shield/voyege_shield/change.py` |
+| Business-rule engine — the money &amp; access invariants, with controls | `shield/voyege_shield/rules.py` |
+| Fraud signals in logs + "seen in traffic" | `shield/voyege_shield/fraud.py` |
+| Verifier, ₹ triage, tickets, approval desk, retest | `shield/voyege_shield/triage.py` |
+| Orchestrator, planner, heartbeats, safety drills | `shield/voyege_shield/orchestrator.py` |
+| Read-only live URL diagnostic agent | `shield/voyege_shield/diagnose.py` |
+| Dashboard + control API (FastAPI + glass UI) | `shield/voyege_shield/server.py`, `shield/voyege_shield/static/` |
 
-<details>
-<summary>Windows, Docker and source installs</summary>
+See [`shield/README.md`](shield/README.md) for the full architecture map and a demo script.
 
-- **Windows** (experimental): download `0-windows-x64.exe` from [Releases](https://github.com/0sec-labs/0security/releases/latest).
-- **Docker**: `docker run --rm ghcr.io/0sec-labs/0security:latest --help`. See the [Docker guide](https://docs.0.security/server-mode/).
-- **Source**: Node.js 24+ and pnpm, then `pnpm install --frozen-lockfile && pnpm build`.
-- `install.sh` supports Apple Silicon macOS and x64/ARM64 Linux. Set `INSTALL_DIR` to change the location.
+## Safety
 
-</details>
+Voyege is read-only by default and runs every request through one gate: a scope allowlist, rate budgets, a
+tamper-evident request log and a kill switch. The live URL diagnostic sends **no attack payloads, changes no
+state and attempts no login**, and it refuses to run until you confirm you are authorised to test the target.
+**Only point Voyege at systems you own or are authorised to test.**
 
-Only point 0 at systems you own or are authorized to test.
+## Scope of this prototype
 
-## What can you do with 0?
-
-- **Talk to a security agent** about a folder on your computer or a remote Computer, in a Thread
-- **Review findings** on a board, with source evidence, and export them
-- **Verify fixes**: a finding is marked Verified by or Not verified
-- **Build persistent security agents**: Sentinels are standing threads that wake on a schedule or on every pull request, with skills, memory and automations written as prompts
-- **Keep memory** as plain notes that every thread can read
-- **Extend** it with [extensions and skills](https://docs.0.security/extensions/)
-
-<p align="center">
-  <a href="assets/readme-findings.mp4">
-    <picture>
-      <img src="assets/readme-findings.gif" alt="0 findings: review the queue, organize the board, and inspect source evidence" width="100%">
-    </picture>
-  </a>
-</p>
-
-## Why 0?
-
-- **Open source**: MIT or Apache-2.0, built in the open
-- **Private**: runs on your computer or in a container, and only the context you send to your chosen model leaves it
-- **Flexible**: any provider key or local OpenAI-compatible server, from the CLI or a coding agent
-- **Evidence first**: every finding links to its source evidence
-- **Verified**: a finding says whether it was verified, and by what
-
-## Coding agents
-
-```bash
-0 sentinels run <id> --task "Review this pull request" --yes
-```
-
-See the [command reference](https://docs.0.security/commands/).
-
-## Learn more
-
-- [Documentation](https://docs.0.security/)
-- [Models and providers](https://docs.0.security/models/)
-- [Extensions](https://docs.0.security/extensions/)
-- [Command reference](https://docs.0.security/commands/)
-- [Security research](https://0.security/research/)
-- [Enterprise](https://0.security/enterprise/)
-
-## Contributing
-
-**0 is built in the open.** Huge thanks to everyone who has filed a bug, fixed a doc or sent a patch.
-
-- **Report bugs** in [issues](https://github.com/0sec-labs/0security/issues)
-- **Improve the docs**
-- **Write an extension** or a skill
-- **Found a vulnerability in 0?** See [SECURITY.md](.github/SECURITY.md)
-
-Start with the [contributing guide](.github/CONTRIBUTING.md). Run `pnpm install` and `pnpm dev` to work on the engine. Open an issue before large changes.
-
-<a href="https://github.com/0sec-labs/0security/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=0sec-labs/0security" alt="Contributors to 0sec-labs/0security" />
-</a>
-
-## License
-
-[MIT](LICENSE-MIT) OR [Apache-2.0](LICENSE-APACHE).
+The business-rule, access, fraud-log and inventory engines run end-to-end against a built-in synthetic
+platform (`shield/voyege_shield/feed.py`) that stands in for the organiser-provided inputs. The live URL
+feature is the read-only posture scan. Active exploitation checks (injection, auth-bypass, state-changing
+tests) are intentionally not included; the safety gate already provides the enforcement those would need.
+Production infrastructure (durable queue, Postgres, secret vault, proxy, ticketing) is represented by
+in-process equivalents behind the same interfaces.

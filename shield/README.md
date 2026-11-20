@@ -1,10 +1,9 @@
 # Voyege Security & Fraud Shield
 
-The custom travel core from *TBO Security & Fraud Shield: Integrated Report* (Part B), built on the
-0security foundation in this repository. It re-checks the travel platform after every change and catches
-broken money and access rules. It watches logs for fraud already in progress, proves each finding twice and
-ranks it in ₹. It then holds Critical/High tickets for a person, sends the ticket to the owning team, and
-closes it only when a retest passes.
+An agentic, real-time security and fraud shield for online booking and travel platforms. It re-checks the
+platform after every change and catches broken money and access rules, watches logs for fraud already in
+progress, proves each finding twice and ranks it in ₹. It then holds Critical/High tickets for a person,
+sends the ticket to the owning team, and closes it only when a retest passes.
 
 ```bash
 ./run.sh                                      # dashboard on http://127.0.0.1:8800

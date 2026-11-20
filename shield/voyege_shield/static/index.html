@@ -130,7 +130,23 @@ body.entered #app{display:block}
 .chips span{font-size:11.5px;color:var(--muted);border:1px solid var(--line);border-radius:999px;padding:4px 10px;background:var(--glass)}
 .hero-skip{margin-top:18px;font-size:13px}
 .hero-skip a{color:var(--teal);cursor:pointer;text-decoration:underline}
-.land-foot{margin-top:40px;color:var(--muted);font-size:12px;text-align:center}
+.land-foot{margin-top:44px;color:var(--muted);font-size:12px;text-align:center}
+.eyebrow{font-size:12px;letter-spacing:1.4px;text-transform:uppercase;color:var(--teal);font-weight:700;margin:0 0 12px}
+.section{margin-top:56px}
+.section > h3{font-size:clamp(20px,3vw,28px);margin:0 0 8px;letter-spacing:-.3px}
+.section > p.sub{color:var(--muted);margin:0 0 22px;max-width:62ch}
+.about-cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:14px}
+.about-card{padding:18px}
+.about-card .ic{width:34px;height:34px;border-radius:10px;display:flex;align-items:center;justify-content:center;background:var(--teal-soft);color:var(--teal);font-size:18px;margin-bottom:10px}
+.about-card h4{margin:0 0 6px;font-size:15px}
+.about-card p{margin:0;color:var(--muted);font-size:13px;line-height:1.5}
+.steps{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:14px;counter-reset:s}
+.step{padding:16px 18px;position:relative}
+.step::before{counter-increment:s;content:counter(s);display:inline-flex;align-items:center;justify-content:center;width:26px;height:26px;border-radius:50%;background:linear-gradient(135deg,var(--teal),var(--violet));color:var(--bg);font-weight:700;font-size:13px;margin-bottom:10px}
+.step h4{margin:0 0 4px;font-size:14px}.step p{margin:0;color:var(--muted);font-size:12.5px;line-height:1.5}
+.scan-section{margin-top:56px;padding:26px}
+.scan-section h3{font-size:clamp(20px,3vw,26px);margin:0 0 6px}
+.scan-section .sub{color:var(--muted);margin:0 0 18px;max-width:60ch;font-size:14px}
 
 /* animated protection visual */
 .viz{position:relative;padding:18px;overflow:hidden;min-height:340px}
@@ -163,20 +179,14 @@ body.entered #app{display:block}
       <button id="landTheme" title="Toggle light/dark">◐</button>
     </div>
 
+    <!-- ABOUT hero -->
     <div class="hero">
       <div>
-        <h2>Diagnose any site.<br><span class="grad">Catch what scanners miss.</span></h2>
-        <p class="lede">Voyege re-checks your platform on every change — broken money rules, cross-agency access, zombie APIs — and proves each finding safely. Point it at a URL for a read-only posture scan, right now.</p>
-        <div class="glass scanbox">
-          <div class="scanrow">
-            <input type="text" id="landUrl" placeholder="https://your-site.com" aria-label="Website URL" autocomplete="off">
-            <button class="primary" id="landGo">Diagnose site</button>
-          </div>
-          <label class="auth"><input type="checkbox" id="landAuth"><span>I own this target or am authorised to test it. Voyege only sends read-only requests (GET, no payloads, no login attempts).</span></label>
-          <div id="landStatus" class="muted" style="margin-top:10px;font-size:13px"></div>
-        </div>
-        <div class="chips"><span>✓ Read-only &amp; safe</span><span>✓ Security headers · TLS · cookies</span><span>✓ Zombie / shadow APIs</span><span>✓ ₹-ranked findings</span></div>
-        <div class="hero-skip">or <a id="landExplore">explore the live dashboard</a> with the built-in demo platform →</div>
+        <p class="eyebrow">About Voyege</p>
+        <h2>Security &amp; fraud,<br><span class="grad">caught the moment your platform changes.</span></h2>
+        <p class="lede">Voyege is an agentic, real-time security and fraud shield for online booking and travel platforms. Every time your app changes, it re-checks the rules that move money and guard data — then proves each problem safely and hands your team a ready-to-fix ticket. It finds the business-logic flaws that ordinary scanners structurally cannot see.</p>
+        <div class="chips"><span>✓ Real-time, change-driven</span><span>✓ Business-rule &amp; fraud engine</span><span>✓ Provable, read-only safety</span><span>✓ ₹-ranked findings</span></div>
+        <div class="hero-skip" style="margin-top:22px"><a id="landExplore">Explore the live dashboard →</a></div>
       </div>
 
       <div class="glass viz" aria-hidden="true">
@@ -190,7 +200,46 @@ body.entered #app{display:block}
       </div>
     </div>
 
-    <div class="land-foot">Built on the open <a href="https://github.com/0sec-labs/0security" style="color:inherit">0security</a> agent foundation (MIT / Apache-2.0). Only point Voyege at systems you are authorised to test.</div>
+    <!-- ABOUT: what it does -->
+    <div class="section">
+      <h3>What Voyege does</h3>
+      <p class="sub">One shield, five jobs — the parts ordinary tools miss, built for how travel platforms actually lose money.</p>
+      <div class="about-cards">
+        <div class="glass about-card"><div class="ic">₹</div><h4>Business-rule engine</h4><p>Checks the rules that move money — refund ≤ paid, charged = quoted, coupon limits, credit caps — against what your platform actually stored.</p></div>
+        <div class="glass about-card"><div class="ic">⇄</div><h4>Multi-agency access checker</h4><p>Tests as two agencies at once to catch cross-tenant reads and privilege jumps a single-identity scan never sees.</p></div>
+        <div class="glass about-card"><div class="ic">◉</div><h4>Zombie &amp; shadow inventory</h4><p>Maps every endpoint from traffic and code, labels forgotten and undocumented ones, and exports an OpenAPI spec.</p></div>
+        <div class="glass about-card"><div class="ic">🛡</div><h4>Provable safety gate</h4><p>One read-only path to the target: scope allowlist, rate limits, kill switch and a tamper-evident log of every request.</p></div>
+        <div class="glass about-card"><div class="ic">✓</div><h4>Verify, rank &amp; ticket</h4><p>Each finding is re-proved independently, priced in ₹ at risk, and sent to the right owner — with auto-retest after the fix.</p></div>
+        <div class="glass about-card"><div class="ic">👁</div><h4>Fraud signals in logs</h4><p>Watches your own logs for abuse already in progress and flags "seen in traffic" on the ticket.</p></div>
+      </div>
+    </div>
+
+    <!-- ABOUT: how it works -->
+    <div class="section">
+      <h3>How it works</h3>
+      <p class="sub">A single loop runs on every change; only one step ever touches the platform being tested.</p>
+      <div class="steps">
+        <div class="glass step"><h4>Detect change</h4><p>A deploy, a new JS bundle, a shifted response or a traffic change starts a run within seconds.</p></div>
+        <div class="glass step"><h4>Discover &amp; plan</h4><p>Build the API map, then plan targeted checks for exactly what changed — not a blind spray.</p></div>
+        <div class="glass step"><h4>Test safely</h4><p>Run the checks through the safety gate on synthetic data, read-only by default.</p></div>
+        <div class="glass step"><h4>Prove &amp; ticket</h4><p>Re-prove each finding, rank it in ₹, ticket the owner, and retest after the fix.</p></div>
+      </div>
+    </div>
+
+    <!-- TRY IT: URL entry -->
+    <div class="glass scan-section" id="try">
+      <p class="eyebrow">Try it now</p>
+      <h3>Diagnose your site</h3>
+      <p class="sub">Enter a URL for an instant read-only posture scan — TLS, security headers, cookies, version disclosure, CORS and the API routes hidden in your front-end code.</p>
+      <div class="scanrow">
+        <input type="text" id="landUrl" placeholder="https://your-site.com" aria-label="Website URL" autocomplete="off">
+        <button class="primary" id="landGo">Diagnose site</button>
+      </div>
+      <label class="auth"><input type="checkbox" id="landAuth"><span>I own this target or am authorised to test it. Voyege only sends read-only requests (GET, no attack payloads, no login attempts).</span></label>
+      <div id="landStatus" class="muted" style="margin-top:10px;font-size:13px"></div>
+    </div>
+
+    <div class="land-foot">Voyege · agentic real-time security &amp; fraud shield. Only point it at systems you are authorised to test.</div>
   </div>
 </div>
 

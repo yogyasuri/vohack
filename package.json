@@ -3,7 +3,7 @@
   "private": true,
   "type": "module",
   "version": "0.41.0",
-  "description": "Voyege: travel security & fraud shield built on the 0security agent foundation.",
+  "description": "Voyege: agentic real-time security & fraud shield for online booking & travel platforms.",
   "bin": {
     "0": "dist/0.js"
   },
@@ -84,15 +84,7 @@
     "autonomous-agents",
     "security-research"
   ],
-  "author": "0security",
-  "homepage": "https://0.security",
-  "bugs": {
-    "url": "https://0.security/contact"
-  },
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/0sec-labs/0security.git"
-  },
+  "author": "Voyege",
   "license": "MIT OR Apache-2.0",
   "engines": {
     "node": ">=24.0.0",
