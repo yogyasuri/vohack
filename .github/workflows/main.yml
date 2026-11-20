@@ -1,0 +1,416 @@
+name: "0: Main"
+
+# One required check: `verify`. It aggregates the parallel jobs below and
+# passes only if each one succeeded or was legitimately skipped by `changes`.
+# The CLI is built ONCE (`build`) and shared with every job as an artifact.
+# Tags never skip anything. On main and branches only the groups a diff can
+# reach run (scripts/ci-changed.sh): a docs-only diff skips the test groups
+# (static still runs: it checks docs and image names). The main diff base is the
+# last GREEN Main run, so a cancelled code commit can never hide behind a later
+# docs-only commit. Multi-check jobs run through scripts/run-checks.mjs: every
+# check runs and the failures are summarised at the end.
+# scripts/ci-local.sh replays these jobs (steps are read from this file).
+
+on:
+  push:
+    # Repository branch pushes are authenticated before code can reach this
+    # workflow. Fork PRs retain the protected public-PR policy-only lane.
+    branches: ["**"]
+    # A tag run is never path-gated: it is the full gate a release depends on.
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: 0-main-${{ github.ref }}
+  # Runs on main and tags are never cancelled: a burst of pushes used to cancel
+  # every run before it finished, so no commit ever got a verdict. Within one
+  # group GitHub keeps the run in progress and only the newest queued run, so the
+  # cost stays bounded. A cancelled Main publishes nothing (docker-publish
+  # requires conclusion == success).
+  cancel-in-progress: false
+
+jobs:
+  changes:
+    # Skipped on tags: a release tag always runs the whole suite.
+    if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+    runs-on: graphide
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      code: ${{ steps.diff.outputs.code }}
+      engine: ${{ steps.diff.outputs.engine }}
+      docs: ${{ steps.diff.outputs.docs }}
+      docker: ${{ steps.diff.outputs.docker }}
+      deps: ${{ steps.diff.outputs.deps }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - id: diff
+        name: Select affected groups
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          base="$BEFORE"
+          if [ "$GITHUB_REF" = "refs/heads/main" ]; then
+            # Diff against the last green Main, not the previous commit: a
+            # superseded (cancelled) run must not leave its changes untested.
+            base="$(gh run list --workflow main.yml --branch main --event push --status success --limit 1 --json headSha --jq '.[0].headSha // empty' 2>/dev/null || true)"
+            git cat-file -e "${base:-x}^{commit}" 2>/dev/null || base=""
+            [ -n "$base" ] || base="$(git rev-parse HEAD)"   # unknown: empty diff makes the script run everything
+          fi
+          bash scripts/ci-changed.sh "$base" | tee -a "$GITHUB_OUTPUT"
+
+  build:
+    name: build CLI once
+    runs-on: graphide
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup-ci
+      - name: Build CLI
+        # `pnpm build` clears tsconfig.tsbuildinfo first so a stale incremental
+        # state can never ship a missing output; the fresh .tsbuildinfo files
+        # travel in the artifact so `pnpm lint` (tsc --noEmit) reuses them.
+        run: pnpm build
+      - name: Share the build
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: build-${{ github.run_id }}
+          path: |
+            dist
+            packages/*/dist
+            packages/*/tsconfig.tsbuildinfo
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
+          overwrite: true
+
+  static:
+    name: static checks
+    needs: build
+    runs-on: graphide
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup-ci
+      - name: Fetch the shared build
+        id: shared-build
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: build-${{ github.run_id }}
+      - name: Rebuild when the shared build is gone
+        if: steps.shared-build.outcome != 'success'
+        run: pnpm build
+      - name: Run every static check and summarise failures
+        run: node scripts/run-checks.mjs static
+
+  engine:
+    name: engine tests
+    needs: [changes, build]
+    if: ${{ !cancelled() && needs.build.result == 'success' && (startsWith(github.ref, 'refs/tags/') || (needs.changes.result == 'success' && needs.changes.outputs.engine == 'true')) }}
+    runs-on: graphide
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup-ci
+      - name: Fetch the shared build
+        id: shared-build
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: build-${{ github.run_id }}
+      - name: Rebuild when the shared build is gone
+        if: steps.shared-build.outcome != 'success'
+        run: pnpm build
+      - name: Check database initialization and engine suites
+        run: pnpm test:workspace-support
+        env:
+          ZERO_CHATGPT_ACCESS_TOKEN: ""
+          ZERO_CHATGPT_OAUTH_REFRESH_TOKEN: ""
+          ZERO_CHATGPT_ACCOUNT_ID: ""
+          ZERO_CODEX_AUTH_JSON_PATH: "/tmp/0-ci-no-auth.json"
+          OPENAI_API_KEY: ""
+          OPENROUTER_API_KEY: ""
+          ANTHROPIC_API_KEY: ""
+          QWEN_API_KEY: ""
+          DEEPSEEK_API_KEY: ""
+          AZURE_OPENAI_API_KEY: ""
+          KIMI_API_KEY: ""
+
+  browser:
+    name: dashboard and browser checks
+    needs: [changes, build]
+    if: ${{ !cancelled() && needs.build.result == 'success' && (startsWith(github.ref, 'refs/tags/') || (needs.changes.result == 'success' && needs.changes.outputs.code == 'true')) }}
+    runs-on: graphide
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup-ci
+      - name: Fetch the shared build
+        id: shared-build
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: build-${{ github.run_id }}
+      - name: Rebuild when the shared build is gone
+        if: steps.shared-build.outcome != 'success'
+        run: pnpm build
+      - name: Install browser
+        run: pnpm --filter @0/engine exec playwright install --with-deps chromium
+      - name: Run every dashboard and browser check and summarise failures
+        run: node scripts/run-checks.mjs browser
+
+  smoke:
+    name: built CLI smoke
+    needs: [changes, build]
+    if: ${{ !cancelled() && needs.build.result == 'success' && (startsWith(github.ref, 'refs/tags/') || (needs.changes.result == 'success' && needs.changes.outputs.code == 'true')) }}
+    runs-on: graphide
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup-ci
+      - name: Fetch the shared build
+        id: shared-build
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: build-${{ github.run_id }}
+      - name: Rebuild when the shared build is gone
+        if: steps.shared-build.outcome != 'success'
+        run: pnpm build
+      - name: Check worker orchestration through built CLI
+        run: bun scripts/check-worker-orchestration-bun.ts packages/cli/dist/index.js
+      - name: Smoke CLI
+        # Install the bundle's external SQLite/parser/browser dependencies in
+        # the published layout before exercising command/script behavior.
+        run: |
+          (cd dist && npm install --omit=dev --no-audit --no-fund)
+          node dist/0.js --help
+          bash scripts/smoke-cli.sh "node dist/0.js"
+
+  unit:
+    name: package and script tests
+    needs: [changes, build]
+    if: ${{ !cancelled() && needs.build.result == 'success' && (startsWith(github.ref, 'refs/tags/') || (needs.changes.result == 'success' && needs.changes.outputs.code == 'true')) }}
+    runs-on: graphide
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup-ci
+      - name: Fetch the shared build
+        id: shared-build
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: build-${{ github.run_id }}
+      - name: Rebuild when the shared build is gone
+        if: steps.shared-build.outcome != 'success'
+        run: pnpm build
+      - name: Install browser for script tests
+        run: pnpm --filter @0/engine exec playwright install --with-deps chromium
+      - name: Run package tests
+        run: pnpm test:public:packages
+        env:
+          ZERO_CHATGPT_ACCESS_TOKEN: ""
+          ZERO_CHATGPT_OAUTH_REFRESH_TOKEN: ""
+          ZERO_CHATGPT_ACCOUNT_ID: ""
+          ZERO_CODEX_AUTH_JSON_PATH: "/tmp/0-ci-no-auth.json"
+          OPENAI_API_KEY: ""
+          OPENROUTER_API_KEY: ""
+          ANTHROPIC_API_KEY: ""
+          QWEN_API_KEY: ""
+          DEEPSEEK_API_KEY: ""
+          AZURE_OPENAI_API_KEY: ""
+          KIMI_API_KEY: ""
+      - name: Run script tests
+        # Always runs, even if the package tests failed: both results are reported.
+        if: ${{ !cancelled() }}
+        run: pnpm test:public:scripts
+
+  docker-server:
+    name: docker server smoke
+    # Builds the image and checks the single-node server story end to end:
+    # health and readiness, an anonymous page that never carries the control
+    # token, bad Host => 403, sign-in, CSRF refusal and a clean SIGTERM.
+    needs: changes
+    if: ${{ !cancelled() && (startsWith(github.ref, 'refs/tags/') || (needs.changes.result == 'success' && needs.changes.outputs.docker == 'true')) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      DOCKER_BUILD_RECORD_UPLOAD: "false"
+      DOCKER_BUILD_SUMMARY: "false"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Validate the compose file
+        run: |
+          set -euo pipefail
+          cp deploy/compose/.env.example deploy/compose/.env
+          ZERO_IMAGE_TAG=latest docker compose -f deploy/compose/docker-compose.yml config -q
+          ZERO_DOMAIN=0.example.com docker compose -f deploy/compose/docker-compose.yml --profile proxy config -q
+          rm deploy/compose/.env
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+        id: buildx
+      - name: Build the image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        with:
+          context: .
+          file: ./scripts/docker/Dockerfile
+          platforms: linux/amd64
+          builder: ${{ steps.buildx.outputs.name }}
+          load: true
+          tags: zero-server-smoke:ci
+          cache-from: |
+            type=gha,scope=0
+            type=gha,scope=docker-server
+          cache-to: type=gha,mode=max,scope=docker-server
+      - name: Tools the server story depends on
+        run: |
+          set -euo pipefail
+          docker run --rm --entrypoint ssh zero-server-smoke:ci -V
+          docker run --rm --entrypoint scp zero-server-smoke:ci -h 2>&1 | head -1 || true
+          docker run --rm --entrypoint gh zero-server-smoke:ci --version
+          docker run --rm --entrypoint git zero-server-smoke:ci --version
+          # one-shot use still works: arguments replace the default command
+          docker run --rm zero-server-smoke:ci --help >/dev/null
+      - name: Start like the compose service does
+        run: |
+          set -euo pipefail
+          TOKEN="$(openssl rand -base64 32)"
+          echo "::add-mask::$TOKEN"
+          echo "ZERO_TEST_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+          docker volume create zero-smoke-data >/dev/null
+          docker run -d --name zero-smoke -p 127.0.0.1:48123:48123 -v zero-smoke-data:/data \
+            -e ZERO_ACCESS_TOKEN="$TOKEN" -e ZERO_ALLOWED_HOSTS=localhost,127.0.0.1 \
+            -e ZERO_TRUSTED_PROXY=172.17.0.0/16 -e ZERO_NO_TELEMETRY=1 \
+            zero-server-smoke:ci --host 0.0.0.0 --server-mode
+      - name: Probe health, anonymous access, Host rules and sign-in
+        run: node scripts/smoke-server-mode.mjs --port 48123 --host-name localhost --token "$ZERO_TEST_TOKEN"
+      - name: Container health status and logs
+        if: always()
+        run: |
+          docker inspect zero-smoke >/dev/null 2>&1 || exit 0
+          docker inspect --format 'health={{.State.Health.Status}}' zero-smoke || true
+          if docker logs zero-smoke 2>&1 | grep -qF "$ZERO_TEST_TOKEN"; then echo "::error::access token found in container logs"; exit 1; fi
+      - name: SIGTERM drains and exits 0
+        run: |
+          set -euo pipefail
+          docker stop --time 30 zero-smoke >/dev/null
+          code="$(docker inspect --format '{{.State.ExitCode}}' zero-smoke)"
+          echo "exit code: $code"
+          test "$code" = "0"
+      - name: Dump logs on failure
+        if: failure()
+        run: docker logs zero-smoke 2>&1 | sed "s|$ZERO_TEST_TOKEN|[token]|g" | tail -80 || true
+
+  docs:
+    name: docs site build
+    needs: changes
+    if: ${{ !cancelled() && (startsWith(github.ref, 'refs/tags/') || (needs.changes.result == 'success' && needs.changes.outputs.docs == 'true')) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Build CLI registrations
+        run: pnpm --filter '@0/cli...' build
+      - run: pnpm --filter @0/docs build
+      - name: Check built documentation links
+        run: node scripts/check-docs-site.mjs --write-marker
+      - name: Keep the built site for the deploy job
+        if: ${{ github.ref == 'refs/heads/main' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: docs-dist-${{ github.run_id }}-${{ github.run_attempt }}
+          path: docs/dist
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 1
+
+  audit:
+    name: npm advisory audit (non-blocking)
+    # Replaces the old Dependency Security workflow's npm job. Advisory drift is
+    # a registry/time effect, so it warns here and never blocks Main or a
+    # release; Dependabot (.github/dependabot.yml) opens the fixing PRs.
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.result == 'success' && needs.changes.outputs.deps == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile --ignore-scripts
+      - name: Audit JavaScript dependencies
+        run: pnpm audit --audit-level=high
+
+  verify:
+    name: verify
+    needs: [changes, build, static, engine, browser, smoke, unit, docker-server, docs]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require every job to pass or be skipped by path
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "job results: $RESULTS"
+          for r in $RESULTS; do
+            case "$r" in success|skipped) ;; *) echo "::error::a verify job finished as '$r'"; exit 1 ;; esac
+          done
+
+  docs-deploy:
+    name: deploy docs
+    # Publishes the docs only from a fully green Main on main, never from a tag
+    # or a branch, and only when the docs inputs changed.
+    needs: [changes, docs, verify]
+    if: ${{ !cancelled() && github.ref == 'refs/heads/main' && needs.verify.result == 'success' && needs.docs.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    concurrency:
+      group: docs-production
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: docs-dist-${{ github.run_id }}-${{ github.run_attempt }}
+          path: docs/dist
+      # Resolve the existing project by its public domain, then publish to
+      # its production branch. Do not silently create an unattached project.
+      - name: Resolve public docs Pages project
+        id: docs-project
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: e84b55c82d29ff76b789af0aea3d9121
+        run: node scripts/diagnose-docs-routing.mjs
+      - name: Deploy to Cloudflare Pages
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: e84b55c82d29ff76b789af0aea3d9121
+        run: |
+          npx --yes wrangler@4 pages deploy docs/dist --project-name="${{ steps.docs-project.outputs.project_name }}" --branch="${{ steps.docs-project.outputs.production_branch }}"
+      - name: Verify public documentation deployment
+        run: node scripts/check-docs-site.mjs --live

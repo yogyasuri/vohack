@@ -1,0 +1,204 @@
+import { useEffect } from "react";
+import { Columns3, Download, List } from "lucide-react";
+import { CapyMoreIcon as MoreHorizontal, CapySearchIcon as Search, CapySlidersIcon as SlidersHorizontal, CapyFilterIcon as ListFilter, CapyCloseIcon as X } from "@/ui/icons/capy";
+import { Button } from "@/components/ui/button";
+import { Tooltip } from "@/ui/components/tooltip";
+import { toast } from "@/ui/components/toast";
+import { DropdownMenu } from "@/components/ui/dropdown-menu";
+import { REPORT_FORMATS, useReportDownload } from "@/components/report-export-control";
+import { cn } from "@/lib/utils";
+import { missionLabel } from "@/lib/vocabulary";
+import { SeverityIcon, StatusIcon } from "./finding-icons";
+import {
+  GROUP_BY_OPTIONS, ORDER_BY_OPTIONS, PRESETS, SEVERITY_LABELS, SEVERITY_ORDER, STATUS_LABEL, STATUS_ORDER, activeFilterCount, missionName, toggleValue,
+  type DisplayOptions, type FindingFilters, type FindingPreset, type MissionLabels,
+} from "./findings-model";
+
+type Facet = { value: string; count: number };
+
+export type FindingsToolbarProps = {
+  total: number;
+  shown: number;
+  preset: FindingPreset;
+  presetCounts: Record<FindingPreset, number>;
+  onPreset: (preset: FindingPreset) => void;
+  display: DisplayOptions;
+  onDisplay: (patch: Partial<DisplayOptions>) => void;
+  filters: FindingFilters;
+  onFilters: (next: FindingFilters) => void;
+  categories: Facet[];
+  missions: Facet[];
+  missionNames: MissionLabels;
+  search: string;
+  onSearch: (value: string) => void;
+  exportPath: string;
+  exportCount: number;
+  searchRef?: React.Ref<HTMLInputElement>;
+};
+
+
+const iconButton = "size-7 text-muted-foreground-1";
+
+export type FindingsTopActionsProps = Pick<FindingsToolbarProps, "display" | "onDisplay" | "search" | "onSearch" | "exportPath" | "exportCount" | "searchRef">;
+
+/** Right side of the page's top bar: search, list/board toggle and export. */
+export function FindingsTopActions({ display, onDisplay, search, onSearch, exportPath, exportCount, searchRef }: FindingsTopActionsProps) {
+  const exporting = useReportDownload(exportPath);
+  useEffect(() => { if (exporting.error) toast({ id: "findings-export-failed", kind: "error", title: "Couldn't export findings", description: exporting.error }); }, [exporting.error]);
+  return (
+    <div className="flex items-center gap-1.5">
+      <label className="relative hidden sm:block">
+        <Search aria-hidden="true" className="pointer-events-none absolute top-1/2 left-2 size-3.5 -translate-y-1/2 text-muted-foreground-2" />
+        <input
+          ref={searchRef}
+          type="search"
+          aria-label="Search findings"
+          autoComplete="off"
+          data-1p-ignore
+          data-lpignore="true"
+          value={search}
+          onChange={event => onSearch(event.target.value)}
+          placeholder="Search"
+          className="h-7 w-44 rounded-md border-[0.5px] border-border-1 bg-transparent pr-2 pl-7 text-xs text-foreground outline-none transition-[width,background-color] duration-150 placeholder:text-muted-foreground-2 hover:bg-section focus:w-64 focus:bg-section focus-visible:outline-ring-inset"
+        />
+      </label>
+      <div role="group" aria-label="Layout" className="flex items-center rounded-md border-[0.5px] border-border-1 p-px">
+        <Tooltip content="List"><Button variant="ghost" size="icon-xs" aria-label="List layout" aria-pressed={display.layout === "list"} data-selected={display.layout === "list" ? "" : undefined} className="size-6" onClick={() => onDisplay({ layout: "list" })}><List /></Button></Tooltip>
+        <Tooltip content="Board"><Button variant="ghost" size="icon-xs" aria-label="Board layout" aria-pressed={display.layout === "board"} data-selected={display.layout === "board" ? "" : undefined} className="size-6" onClick={() => onDisplay({ layout: "board" })}><Columns3 /></Button></Tooltip>
+      </div>
+      <DropdownMenu>
+        <DropdownMenu.Trigger render={<Button variant="ghost" size="icon-sm" aria-label="More actions" className={iconButton} />}><MoreHorizontal /></DropdownMenu.Trigger>
+        <DropdownMenu.Content align="end" className="w-56">
+          <DropdownMenu.Label>Export {exportCount} finding{exportCount === 1 ? "" : "s"}</DropdownMenu.Label>
+          {REPORT_FORMATS.map(([format, label]) => (
+            <DropdownMenu.Item key={format} icon={<Download />} disabled={exportCount === 0 || exporting.busy} onClick={() => void exporting.download(format)}>{label}</DropdownMenu.Item>
+          ))}
+        </DropdownMenu.Content>
+      </DropdownMenu>
+    </div>
+  );
+}
+
+/** Capy's second and third rows: state tabs with filter and display buttons at the right, then the active filter chips. */
+export function FindingsToolbar(props: FindingsToolbarProps) {
+  const { total, shown, preset, presetCounts, onPreset, display, onDisplay, filters } = props;
+  const count = activeFilterCount(filters);
+  return (
+    <div className="shrink-0">
+      <div className="flex min-h-12 flex-wrap items-center gap-x-2 gap-y-1 px-3 py-2">
+        <h1 className="sr-only">Findings <span aria-label={`${shown} of ${total} findings`}>{`${shown} of ${total}`}</span></h1>
+        <PresetTabs preset={preset} counts={presetCounts} total={total} onPreset={onPreset} />
+        <div className="ml-auto flex items-center gap-1.5">
+          <FilterMenu {...props} />
+          <DisplayMenu display={display} onDisplay={onDisplay} />
+        </div>
+      </div>
+      {count > 0 ? <FilterChips {...props} /> : null}
+    </div>
+  );
+}
+
+const tabClass = "inline-flex h-7 items-center gap-1.5 rounded-md px-2 text-xs font-medium whitespace-nowrap text-muted-foreground-1 transition-colors duration-100 outline-none hover:text-foreground focus-visible:outline-ring-inset data-[selected]:bg-secondary data-[selected]:text-foreground";
+
+/** State tabs with a count; the open-work tab carries an accent badge, the rest plain numbers. */
+function PresetTabs({ preset, counts, total, onPreset }: { preset: FindingPreset; counts: Record<FindingPreset, number>; total: number; onPreset: (preset: FindingPreset) => void }) {
+  return (
+    <div role="tablist" aria-label="Finding state" className="flex min-w-0 items-center gap-1 overflow-x-auto">
+      {PRESETS.map(item => {
+        const count = item.value === "all" ? total : counts[item.value];
+        const selected = preset === item.value;
+        return (
+          <button key={item.value} type="button" role="tab" aria-selected={selected} data-selected={selected ? "" : undefined} className={tabClass} onClick={() => onPreset(item.value)}>
+            {item.label}
+            {item.value === "review" && count > 0
+              ? <span className="grid h-4 min-w-4 place-items-center rounded-[3px] bg-primary px-1 text-[11px] leading-none tabular-nums text-primary-foreground">{count}</span>
+              : <span className="text-xs tabular-nums text-muted-foreground-2">{count}</span>}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+function DisplayMenu({ display, onDisplay }: Pick<FindingsToolbarProps, "display" | "onDisplay">) {
+  return (
+    <DropdownMenu>
+      <DropdownMenu.Trigger render={<Button variant="ghost" size="icon-sm" aria-label="Display options" className={iconButton} />}><SlidersHorizontal /></DropdownMenu.Trigger>
+      <DropdownMenu.Content align="end" className="w-60">
+        <DropdownMenu.Label>Group by</DropdownMenu.Label>
+        {GROUP_BY_OPTIONS.map(option => <DropdownMenu.Item key={option.value} selected={display.groupBy === option.value} onClick={() => onDisplay({ groupBy: option.value })}>{option.label}</DropdownMenu.Item>)}
+        <DropdownMenu.Label>Order by</DropdownMenu.Label>
+        {ORDER_BY_OPTIONS.map(option => <DropdownMenu.Item key={option.value} selected={display.orderBy === option.value} onClick={() => onDisplay({ orderBy: option.value })}>{option.label}</DropdownMenu.Item>)}
+        <DropdownMenu.Label>Direction</DropdownMenu.Label>
+        <DropdownMenu.Item selected={display.direction === "desc"} onClick={() => onDisplay({ direction: "desc" })}>Descending</DropdownMenu.Item>
+        <DropdownMenu.Item selected={display.direction === "asc"} onClick={() => onDisplay({ direction: "asc" })}>Ascending</DropdownMenu.Item>
+      </DropdownMenu.Content>
+    </DropdownMenu>
+  );
+}
+
+function FilterMenu({ filters, onFilters, categories, missions, missionNames }: FindingsToolbarProps) {
+  const count = activeFilterCount(filters);
+  const keep = { closeOnClick: false } as const;
+  return (
+    <DropdownMenu>
+      <DropdownMenu.Trigger render={<Button variant="ghost" size="icon-sm" aria-label="Filter findings" className={cn(iconButton, "relative", count > 0 && "text-foreground")} />}>
+        <ListFilter />
+        {count > 0 ? <span aria-hidden="true" className="absolute -top-0.5 -right-0.5 size-1.5 rounded-full bg-primary" /> : null}
+      </DropdownMenu.Trigger>
+      <DropdownMenu.Content align="end" className="w-60">
+        <DropdownMenu.Label>Severity</DropdownMenu.Label>
+        {SEVERITY_ORDER.map(level => (
+          <DropdownMenu.Item key={level} {...keep} icon={<SeverityIcon severity={level} />} selected={filters.severity.includes(level)} onClick={() => onFilters({ ...filters, severity: toggleValue(filters.severity, level) })}>{SEVERITY_LABELS[level]}</DropdownMenu.Item>
+        ))}
+        <DropdownMenu.Label>Status</DropdownMenu.Label>
+        {STATUS_ORDER.map(status => (
+          <DropdownMenu.Item key={status} {...keep} icon={<StatusIcon status={status} />} selected={filters.status.includes(status)} onClick={() => onFilters({ ...filters, status: toggleValue(filters.status, status) })}>{STATUS_LABEL[status]}</DropdownMenu.Item>
+        ))}
+        {categories.length > 0 ? <DropdownMenu.Label>Category</DropdownMenu.Label> : null}
+        {categories.map(item => (
+          <DropdownMenu.Item key={item.value} {...keep} selected={filters.category.includes(item.value)} onClick={() => onFilters({ ...filters, category: toggleValue(filters.category, item.value) })}>
+            <span className="min-w-0 flex-1 truncate">{item.value}</span><span className="text-xs tabular-nums text-muted-foreground-2">{item.count}</span>
+          </DropdownMenu.Item>
+        ))}
+        {missions.length > 0 ? <DropdownMenu.Label>{missionLabel}</DropdownMenu.Label> : null}
+        {missions.map(item => (
+          <DropdownMenu.Item key={item.value} {...keep} selected={filters.mission.includes(item.value)} onClick={() => onFilters({ ...filters, mission: toggleValue(filters.mission, item.value) })}>
+            <span className="min-w-0 flex-1 truncate">{missionName(item.value, missionNames)}</span><span className="text-xs tabular-nums text-muted-foreground-2">{item.count}</span>
+          </DropdownMenu.Item>
+        ))}
+      </DropdownMenu.Content>
+    </DropdownMenu>
+  );
+}
+
+const chip = "inline-flex h-6 max-w-full items-center gap-1.5 rounded-md border-[0.5px] border-border-2 bg-card pr-0.5 pl-2 text-xs text-foreground";
+
+function FilterChip({ label, values, onRemove }: { label: string; values: string; onRemove: () => void }) {
+  return (
+    <span className={chip}>
+      <span className="text-muted-foreground-1">{label}</span>
+      <span className="text-muted-foreground-2">{values.includes(", ") ? "is either of" : "is"}</span>
+      <span className="min-w-0 truncate">{values}</span>
+      <button type="button" aria-label={`Remove ${label} filter`} onClick={onRemove} className="grid size-5 place-items-center rounded-sm text-muted-foreground-2 outline-none hover:bg-secondary hover:text-foreground focus-visible:outline-ring-inset"><X className="size-3" /></button>
+    </span>
+  );
+}
+
+function FilterChips({ filters, onFilters, missionNames }: FindingsToolbarProps) {
+  const multiple = activeFilterCount(filters) > 1;
+  return (
+    <div className="flex flex-wrap items-center gap-1.5 px-3 pb-2" role="group" aria-label="Active filters">
+      {multiple ? (
+        <button type="button" className={cn(chip, "gap-1.5 pr-2 outline-none hover:bg-secondary focus-visible:outline-ring-inset")} onClick={() => onFilters({ ...filters, match: filters.match === "all" ? "any" : "all" })}>
+          <span className="text-muted-foreground-1">Match</span>{filters.match === "all" ? "All filters" : "Any filter"}
+        </button>
+      ) : null}
+      {filters.severity.length ? <FilterChip label="Severity" values={filters.severity.map(level => SEVERITY_LABELS[level]).join(", ")} onRemove={() => onFilters({ ...filters, severity: [] })} /> : null}
+      {filters.status.length ? <FilterChip label="Status" values={filters.status.map(status => STATUS_LABEL[status]).join(", ")} onRemove={() => onFilters({ ...filters, status: [] })} /> : null}
+      {filters.category.length ? <FilterChip label="Category" values={filters.category.join(", ")} onRemove={() => onFilters({ ...filters, category: [] })} /> : null}
+      {filters.mission.length ? <FilterChip label={missionLabel} values={filters.mission.map(key => missionName(key, missionNames)).join(", ")} onRemove={() => onFilters({ ...filters, mission: [] })} /> : null}
+      <Button variant="ghost" size="sm" className="ml-auto h-6 px-2" onClick={() => onFilters({ ...filters, severity: [], status: [], category: [], mission: [] })}>Clear</Button>
+    </div>
+  );
+}

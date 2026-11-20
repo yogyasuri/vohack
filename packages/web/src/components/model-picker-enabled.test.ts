@@ -1,0 +1,114 @@
+import { describe, expect, it } from "vitest";
+import { arrangeCatalog, failingProvidersNotice, firstEnabledMatch, filterModels, isModelEnabled, railEntries } from "./model-picker";
+import { readModelCatalog, writeModelCatalog } from "@/lib/model-catalog-cache";
+
+describe("model enablement", () => {
+  it("treats a missing flag as enabled and only false as off", () => {
+    expect(isModelEnabled({})).toBe(true);
+    expect(isModelEnabled({ enabled: true })).toBe(true);
+    expect(isModelEnabled({ enabled: false })).toBe(false);
+  });
+  it("keeps disabled rows in search results so they can be shown as turned off", () => {
+    const models = [{ id: "a", provider: "openai", enabled: false }, { id: "b", provider: "openai", enabled: true }];
+    expect(filterModels(models, "", "").map(model => model.id)).toEqual(["a", "b"]);
+    expect(filterModels(models, "", "").filter(isModelEnabled).map(model => model.id)).toEqual(["b"]);
+  });
+  it("keeps the enabled flag through the session cache", () => {
+    const store = new Map<string, string>();
+    const storage = { getItem: (key: string) => store.get(key) ?? null, setItem: (key: string, value: string) => void store.set(key, value), removeItem: (key: string) => void store.delete(key) };
+    const scope = { backendId: "b1" };
+    writeModelCatalog(scope, { models: [{ id: "a", provider: "openai", price: "", contextWindowTokens: null, source: "account", enabled: false }], providerId: null, diagnostics: [], roles: [] }, storage);
+    expect(readModelCatalog(scope, storage)?.models[0]?.enabled).toBe(false);
+  });
+});
+
+describe("catalog arrangement", () => {
+  const models = ["gpt-5.2-pro", "gpt-5-2025-08-07", "gpt-5", "gpt-5.2-pro-2025-12-11", "gpt-5.5-pro-2026-04-23", "gpt-4.1", "gpt-5.5", "gpt-4o"].map(id => ({ id, provider: "openai" }))
+    .concat([{ id: "claude-sonnet-4-5", provider: "anthropic" }, { id: "claude-opus-4-5", provider: "anthropic" }, { id: "deepseek-chat", provider: "deepseek" }]);
+  it("orders newest first, hides snapshots and keeps the provider order fixed whatever is selected", () => {
+    const layout = arrangeCatalog({ models, selectedProvider: "anthropic" });
+    expect(layout.groups.map(group => group.id)).toEqual(["openai", "anthropic", "deepseek"]);
+    expect(arrangeCatalog({ models, selectedProvider: "deepseek" }).groups.map(group => group.id)).toEqual(["openai", "anthropic", "deepseek"]);
+    expect(layout.groups[1]!.models.map(row => row.id)).toEqual(["claude-opus-4-5", "claude-sonnet-4-5"]);
+    expect(layout.groups[0]!.models.map(row => row.id)).toEqual(["gpt-5.5-pro-2026-04-23", "gpt-5.5", "gpt-5.2-pro", "gpt-5", "gpt-4.1", "gpt-4o"]);
+    expect(layout.recent).toEqual([]);
+  });
+  it("shows recents first without reordering providers, and hides them while searching", () => {
+    const recents = [{ providerId: "deepseek", model: "deepseek-chat" }, { providerId: "openai", model: "retired-model" }];
+    const layout = arrangeCatalog({ models, recents });
+    expect(layout.recent.map(row => row.id)).toEqual(["deepseek-chat"]);
+    expect(layout.groups.map(group => group.id)).toEqual(["openai", "anthropic", "deepseek"]);
+    expect(arrangeCatalog({ models, recents, query: "claude" }).recent).toEqual([]);
+  });
+  it("search keeps prefix matches first and lets a date query find snapshots", () => {
+    expect(arrangeCatalog({ models, query: "opus" }).groups.flatMap(group => group.models.map(row => row.id))[0]).toBe("claude-opus-4-5");
+    expect(arrangeCatalog({ models, query: "2025-08" }).groups[0]!.models.map(row => row.id)).toEqual(["gpt-5-2025-08-07"]);
+    expect(arrangeCatalog({ models, query: "gpt-5" }).groups[0]!.models.map(row => row.id)).not.toContain("gpt-5-2025-08-07");
+  });
+});
+
+describe("failing providers", () => {
+  it("never list a failing provider or its models", () => {
+    const models = [{ id: "gpt-5", provider: "openai" }, { id: "deepseek-chat", provider: "deepseek" }];
+    const layout = arrangeCatalog({ models, diagnostics: [{ providerId: "deepseek" }, { providerId: "azure" }] });
+    expect(layout.groups.map(group => group.id)).toEqual(["openai"]);
+  });
+});
+
+describe("provider rail", () => {
+  const layout = arrangeCatalog({ models: [{ id: "gpt-5", provider: "openai" }], providers: [{ id: "openai", label: "OpenAI API" }] });
+  const connections = [{ id: "openai", label: "OpenAI API", connected: true }, { id: "azure", label: "Azure OpenAI", connected: true }, { id: "deepseek", label: "DeepSeek", connected: true },
+    { id: "anthropic", label: "Anthropic", connected: false, hint: "Connect Anthropic" }];
+  it("keeps connected providers without models and lists unconnected ones last, but hides failing ones", () => {
+    const rail = railEntries({ layout, connections, failing: ["deepseek"] });
+    expect(rail.map(entry => [entry.id, entry.kind])).toEqual([["openai", "models"], ["azure", "empty"], ["anthropic", "connect"]]);
+  });
+  it("shows only matching providers while searching", () => {
+    expect(railEntries({ layout, connections, searching: true }).map(entry => entry.id)).toEqual(["openai"]);
+  });
+});
+
+describe("recommended picks", () => {
+  const models = [{ id: "gpt-6-luna", provider: "openai" }, { id: "gpt-6-sol", provider: "openai", enabled: false }, { id: "other", provider: "azure" }];
+  const recommended = [
+    { role: "orchestrator", label: "Orchestrator", providerId: "openai", model: "gpt-6-luna" },
+    { role: "exploit", label: "Exploit analysis", providerId: "openai", model: "gpt-6-sol" },
+    { role: "scanner", label: "Scanner", providerId: "azure", model: "missing" },
+  ];
+  it("lists only enabled, reachable picks first on the rail and hides them while searching", () => {
+    const layout = arrangeCatalog({ models, recommended });
+    expect(layout.recommended.map(row => [row.id, row.roleLabel])).toEqual([["gpt-6-luna", "Orchestrator"]]);
+    expect(railEntries({ layout })[0]).toMatchObject({ id: "recommended", kind: "recommended" });
+    expect(arrangeCatalog({ models, recommended, query: "luna" }).recommended).toEqual([]);
+  });
+  it("keeps recents after the recommended entry", () => {
+    const layout = arrangeCatalog({ models, recommended, recents: [{ providerId: "azure", model: "other" }] });
+    expect(railEntries({ layout }).map(entry => entry.kind).slice(0, 2)).toEqual(["recommended", "recent"]);
+  });
+  it("survives the session cache round trip", () => {
+    const store = new Map<string, string>(); const storage = { getItem: (k: string) => store.get(k) ?? null, setItem: (k: string, v: string) => void store.set(k, v), removeItem: (k: string) => void store.delete(k) } as unknown as Storage;
+    const scope = { backendId: "b" };
+    writeModelCatalog(scope, { models: [{ id: "gpt-6-luna", provider: "openai", price: "x", contextWindowTokens: null, source: "account" }], roles: [], providerId: null, diagnostics: [], recommended }, storage);
+    expect(readModelCatalog(scope, storage)?.recommended?.map(item => item.model)).toEqual(["gpt-6-luna", "gpt-6-sol", "missing"]);
+  });
+});
+
+describe("picker keyboard and notices", () => {
+  const models = [{ id: "gpt-xai-pro", provider: "xai" }, { id: "gpt-5", provider: "openai", enabled: false }, { id: "gpt-4.1", provider: "openai" }];
+  it("Enter picks the best enabled match only while a query is typed", () => {
+    expect(firstEnabledMatch(arrangeCatalog({ models, query: "pro" }), true)?.id).toBe("gpt-xai-pro");
+    expect(firstEnabledMatch(arrangeCatalog({ models, query: "gpt-5" }), true)).toBeUndefined();
+    expect(firstEnabledMatch(arrangeCatalog({ models }), false)).toBeUndefined();
+  });
+  it("names the providers that could not list models", () => {
+    expect(failingProvidersNotice([])).toBeUndefined();
+    expect(failingProvidersNotice([{ providerId: "xai" }, { providerId: "xai" }])).toBe("Couldn't load models from xAI. Check Connections.");
+    expect(failingProvidersNotice([{ providerId: "xai" }], [], false)).toBe("Couldn't load models. Check xAI in Connections.");
+  });
+  it("lists one recommended row per model and names every role it serves", () => {
+    const pick = (role: string, label: string) => ({ role, label, providerId: "azure", model: "DeepSeek-V4-Pro" });
+    const layout = arrangeCatalog({ models: [{ id: "DeepSeek-V4-Pro", provider: "azure" }], recommended: [pick("orchestrator", "Main model"), pick("reader", "Reading code"), pick("hard", "Hard problems")] });
+    expect(layout.recommended).toHaveLength(1);
+    expect(layout.recommended[0]!.roleLabel).toBe("Main model, Reading code, Hard problems");
+  });
+});

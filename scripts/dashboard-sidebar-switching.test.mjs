@@ -1,0 +1,74 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { createServer } from "node:http";
+import { resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { build } from "esbuild";
+import { chromium } from "playwright";
+const dashboard = fileURLToPath(new URL("../packages/web/", import.meta.url));
+
+test("sidebar switches without document reloads and late resumes cannot hijack selection", async () => {
+  const directory = await mkdtemp(resolve(dashboard, ".sidebar-switch-test-"));
+  let server, browser;
+  try {
+    const stub = resolve(directory, "stub.tsx");
+    await writeFile(stub, `import {useState} from "react";
+      const host={id:"local",name:"My Mac",status:"connected",platform:{os:"darwin"}};
+      export const useBackendSelection=()=>({backendId:"local",backends:[host]});
+      export const useTeamAccess=()=>({enabled:false});
+      export const usePersistentState=(_key,value)=>useState(value);
+      export const CHAT_DRAG_MIME="application/x-chat";
+      export const consoleSnapshotKey=(host,id)=>["console-snapshot",host,id];
+      export const createChatOnExecutionHost=async()=>({id:"created"});
+      const live=["alpha","beta"].map(id=>({id,title:id,target:"",status:"ready",messageCount:2,updatedAt:new Date().toISOString(),createdAt:new Date().toISOString()}));
+      live.push({...live[0],id:"review-one",title:"Same review",messageCount:843},{...live[0],id:"review-two",title:"Same review",messageCount:262});
+      const saved=[{id:"saved",summary:"Saved chat",messageCount:2,savedAt:Date.now()-1000},{id:"saved-second",summary:"Second saved chat",messageCount:2,savedAt:Date.now()-2000},{id:"saved-cancel",summary:"Cancelled opening",messageCount:2,savedAt:Date.now()-3000}];
+      const api={client:{backendId:"local",dispose(){}},listConsoleSessions:()=>window.blockHistory?new Promise(()=>{}):Promise.resolve(live),listSavedConsoleSessions:()=>Promise.resolve(saved),getConsoleSnapshot:async id=>({session:live.find(s=>s.id===id)}),resumeConsoleSession:(id)=>new Promise(resolve=>{window.resolveResume=()=>{window.blockHistory=true;resolve({...live[0],id:"resumed-"+id,title:"Resumed "+id,savedId:id});};})};
+      export const useBackendApi=()=>{if(new Error().stack.includes('HostChatSource'))window.hostGroupRenders=(window.hostGroupRenders??0)+1;return api;};
+      export const createBackendApi=()=>api;
+      export const localControlFetch=()=>Promise.resolve(Response.json({}));
+    `);
+    const bundle = await build({ stdin: { contents: `
+      import React,{useState,useRef} from "react"; import {createRoot} from "react-dom/client";
+      import {BrowserRouter,useLocation} from "react-router-dom";
+      import {QueryClient,QueryClientProvider} from "@tanstack/react-query";
+      import {HostSidebarChatHistory} from "./src/components/host-sidebar-chat-history";
+      import {ConversationSkeleton} from "./src/console/loading-state";
+      function App(){const location=useLocation();const[pending,setPending]=useState(null);const[draft,setDraft]=useState("");const[dock,setDock]=useState(false);const current=useRef(null);const draftRef=useRef('');draftRef.current=draft;const create=useRef(()=>{window.createdDraft=draftRef.current;}).current;const select=value=>{current.current=value;setPending(value);};return <><input aria-label="Draft" value={draft} onChange={event=>setDraft(event.target.value)}/><HostSidebarChatHistory onSelect={()=>{window.selectedDraft=draft;}} onCreate={backendId=>{create(backendId);}} onPendingChatChange={select} isPendingChatCurrent={value=>current.current?.id===value.id&&current.current?.backendId===value.backendId} onOpenDockChat={dock?(id)=>{window.docked={id,draft};}:undefined}/><button onClick={()=>setDock(!dock)}>Toggle dock</button><button onClick={()=>select(null)}>Cancel opening</button><output id="route">{location.pathname}</output><h1>{pending?.title??location.pathname}</h1>{pending?<section data-pending-chat={pending.id}><ConversationSkeleton/></section>:<div id="transcript">Visible transcript: {location.pathname}</div>}</>;}
+      createRoot(document.getElementById("root")).render(<BrowserRouter><QueryClientProvider client={new QueryClient({defaultOptions:{queries:{retry:false}}})}><App/></QueryClientProvider></BrowserRouter>);
+    `, resolveDir: dashboard, loader: "tsx" }, outfile: resolve(directory,"fixture.js"), write:false, bundle:true, platform:"browser",format:"esm",jsx:"automatic", loader:{".css":"empty",".svg":"dataurl"},alias:{"@/api":stub,"@/backend-context":stub,"@/components/team-access":stub,"@/lib/use-persistent-state":stub,"@/console/use-console-workspace":stub,"@/console/dock-workspace":stub,"@/console/model-source":stub,"@":resolve(dashboard,"src")},logLevel:"silent" });
+    let documents = 0;
+    server = createServer((request,response)=>{if(request.url==="/fixture.js"){response.writeHead(200,{"Content-Type":"application/javascript"});response.end(bundle.outputFiles[0].contents);}else{documents++;response.writeHead(200,{"Content-Type":"text/html"});response.end('<div id="root"></div><script type="module" src="/fixture.js"></script>');}});
+    await new Promise(resolve=>server.listen(0,"127.0.0.1",resolve));
+    browser=await chromium.launch({headless:true});const page=await browser.newPage();
+    const errors=[];page.on("pageerror",error=>errors.push(error.message));
+    await page.goto(`http://127.0.0.1:${server.address().port}/`);
+    const sameTitle = page.locator('a').filter({hasText:"Same review"});
+    await sameTitle.first().waitFor();
+    assert.equal(await sameTitle.count(),2,"distinct transcripts with the same title both remain visible");
+    assert.equal(await sameTitle.nth(0).getAttribute("href"),"/chats/review-one");
+    assert.equal(await sameTitle.nth(1).getAttribute("href"),"/chats/review-two");
+    assert.match(await sameTitle.nth(0).innerText(),/Same review[\s\S]*My Mac/);
+    assert.match(await sameTitle.nth(1).innerText(),/Same review[\s\S]*My Mac/);
+    const groupRenders = await page.evaluate(()=>window.hostGroupRenders);
+    await page.getByRole("textbox",{name:"Draft"}).pressSequentially("Latest draft");
+    assert.equal(await page.evaluate(()=>window.hostGroupRenders),groupRenders,"draft renders do not rebuild host chat groups");
+    await page.locator('a[href="/chats/alpha"]').click();
+    await page.waitForFunction(()=>document.querySelector("#route").textContent==="/chats/alpha");
+    assert.equal(await page.evaluate(()=>window.selectedDraft),"Latest draft","memoized group selection uses the latest parent closure");
+    assert.equal(documents,1,"in-app navigation keeps the document and sidebar mounted");
+    await page.locator('a[href="/chats/alpha"]').click();
+    await page.waitForFunction(()=>document.querySelector("#route").textContent==="/chats/alpha");
+    assert.equal(await page.getByRole("dialog").count(),0,"selecting a title never opens delete controls");
+    await page.getByRole("button",{name:"Toggle dock"}).dispatchEvent("click"); // the unstyled fixture shifts layout when the focused row drops its inline actions, which swallows a pointer click
+    await page.waitForTimeout(100);
+    const dockGroupRenders=await page.evaluate(()=>window.hostGroupRenders);
+    await page.getByRole("textbox",{name:"Draft"}).fill("Fresh dock callback");
+    assert.equal(await page.evaluate(()=>window.hostGroupRenders),dockGroupRenders,"dock callbacks stay stable across draft renders");
+    await page.locator('a[href="/chats/beta"]').click();
+    assert.deepEqual(await page.evaluate(()=>window.docked),{id:"beta",draft:"Fresh dock callback"},"adding a dock handler uses its latest closure");
+    assert.equal(await page.locator("#route").innerText(),"/chats/alpha","dock mode replaces route navigation only when supplied");
+    assert.deepEqual(errors,[]);
+  } finally {await browser?.close();if(server)await new Promise(resolve=>server.close(resolve));await rm(directory,{recursive:true,force:true});}
+});

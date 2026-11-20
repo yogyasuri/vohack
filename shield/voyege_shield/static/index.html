@@ -1,0 +1,326 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Voyege Shield</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0' stop-color='%235eead4'/%3E%3Cstop offset='1' stop-color='%23a78bfa'/%3E%3C/linearGradient%3E%3C/defs%3E%3Cpath d='M16 2l12 5v8c0 8-5 13-12 15C9 28 4 23 4 15V7z' fill='url(%23g)'/%3E%3C/svg%3E">
+<style>
+:root{
+  --bg:#eef2fb; --ink:#121a33; --muted:#55607d; --line:rgba(18,26,51,.12);
+  --glass:rgba(255,255,255,.58); --glass-strong:rgba(255,255,255,.78);
+  --teal:#0f766e; --teal-soft:rgba(15,118,110,.12); --violet:#6d28d9; --sky:#0369a1;
+  --crit:#b42318; --high:#c2410c; --med:#a16207; --low:#475569; --ok:#15803d;
+  --aurora1:rgba(94,234,212,.35); --aurora2:rgba(167,139,250,.32); --aurora3:rgba(56,189,248,.22);
+  --shadow:0 10px 30px rgba(18,26,51,.08);
+}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){
+  --bg:#0b1020; --ink:#e8ecf8; --muted:#9aa6c4; --line:rgba(232,236,248,.12);
+  --glass:rgba(22,31,56,.55); --glass-strong:rgba(26,36,64,.8);
+  --teal:#5eead4; --teal-soft:rgba(94,234,212,.14); --violet:#a78bfa; --sky:#7dd3fc;
+  --crit:#f97066; --high:#fb923c; --med:#facc15; --low:#94a3b8; --ok:#4ade80;
+  --aurora1:rgba(94,234,212,.20); --aurora2:rgba(167,139,250,.22); --aurora3:rgba(56,189,248,.14);
+  --shadow:0 10px 30px rgba(0,0,0,.35);
+}}
+:root[data-theme="dark"]{
+  --bg:#0b1020; --ink:#e8ecf8; --muted:#9aa6c4; --line:rgba(232,236,248,.12);
+  --glass:rgba(22,31,56,.55); --glass-strong:rgba(26,36,64,.8);
+  --teal:#5eead4; --teal-soft:rgba(94,234,212,.14); --violet:#a78bfa; --sky:#7dd3fc;
+  --crit:#f97066; --high:#fb923c; --med:#facc15; --low:#94a3b8; --ok:#4ade80;
+  --aurora1:rgba(94,234,212,.20); --aurora2:rgba(167,139,250,.22); --aurora3:rgba(56,189,248,.14);
+  --shadow:0 10px 30px rgba(0,0,0,.35);
+}
+*{box-sizing:border-box}
+html,body{margin:0}
+body{
+  font:14px/1.5 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; color:var(--ink);
+  background:
+    radial-gradient(1100px 650px at 5% -10%,var(--aurora1),transparent 60%),
+    radial-gradient(900px 600px at 105% 5%,var(--aurora2),transparent 60%),
+    radial-gradient(900px 700px at 50% 115%,var(--aurora3),transparent 60%),var(--bg);
+  background-attachment:fixed; min-height:100vh;
+}
+.wrap{max-width:1280px;margin:0 auto;padding:20px 16px 60px}
+.glass{background:var(--glass);border:1px solid var(--line);border-radius:16px;box-shadow:var(--shadow);
+  backdrop-filter:blur(18px) saturate(140%);-webkit-backdrop-filter:blur(18px) saturate(140%)}
+header{display:flex;flex-wrap:wrap;gap:12px;align-items:center;justify-content:space-between;padding:14px 18px;margin-bottom:16px}
+.brand{display:flex;gap:12px;align-items:center}
+.brand svg{width:34px;height:34px}
+.brand h1{font-size:18px;margin:0;letter-spacing:.2px}
+.brand small{display:block;color:var(--muted);font-size:12px}
+.pills{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.pill{font-size:12px;padding:4px 10px;border-radius:999px;border:1px solid var(--line);background:var(--glass-strong);white-space:nowrap}
+.pill.ok{color:var(--ok)} .pill.bad{color:var(--crit)}
+button{font:inherit;cursor:pointer;border-radius:10px;border:1px solid var(--line);background:var(--glass-strong);color:var(--ink);padding:7px 12px}
+button:hover{border-color:var(--teal)}
+button.primary{background:var(--teal);color:var(--bg);border-color:transparent;font-weight:600}
+button.danger{background:var(--crit);color:#fff;border-color:transparent;font-weight:600}
+button:disabled{opacity:.5;cursor:default}
+.grid{display:grid;gap:12px}
+.stats{grid-template-columns:repeat(auto-fit,minmax(140px,1fr));margin-bottom:16px}
+.stat{padding:12px 14px}
+.stat b{display:block;font-size:22px;font-variant-numeric:tabular-nums}
+.stat span{color:var(--muted);font-size:12px}
+.controls{padding:14px 16px;margin-bottom:16px;display:flex;flex-wrap:wrap;gap:16px;align-items:flex-start}
+.controls .group{display:flex;flex-direction:column;gap:6px;min-width:0}
+.controls .group > span{font-size:11px;text-transform:uppercase;letter-spacing:.6px;color:var(--muted)}
+.controls .row{display:flex;gap:6px;flex-wrap:wrap}
+input[type=text]{font:inherit;padding:7px 10px;border-radius:10px;border:1px solid var(--line);background:var(--glass-strong);color:var(--ink);min-width:0;width:220px;max-width:100%}
+nav.tabs{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px}
+nav.tabs button{border-radius:999px}
+nav.tabs button.on{background:var(--teal-soft);border-color:var(--teal);color:var(--teal);font-weight:600}
+section{display:none} section.on{display:block}
+.cards{display:grid;gap:12px;grid-template-columns:repeat(auto-fill,minmax(340px,1fr))}
+@media (max-width:420px){.cards{grid-template-columns:1fr}}
+.card{padding:14px 16px;display:flex;flex-direction:column;gap:8px}
+.card h3{margin:0;font-size:15px}
+.meta{display:flex;flex-wrap:wrap;gap:6px;font-size:12px;color:var(--muted)}
+.sev{font-weight:700;font-size:11px;padding:2px 8px;border-radius:999px;color:#fff}
+.sev.Critical{background:var(--crit)} .sev.High{background:var(--high)} .sev.Medium{background:var(--med);color:#111} .sev.Low{background:var(--low)}
+.status{font-size:11px;padding:2px 8px;border-radius:999px;border:1px solid var(--line)}
+.status.closed{color:var(--ok);border-color:var(--ok)} .status.awaiting_approval{color:var(--high);border-color:var(--high)}
+.money{font-variant-numeric:tabular-nums;font-weight:600}
+ul.tight{margin:0;padding-left:18px} ul.tight li{margin:2px 0}
+.tablewrap{overflow-x:auto;border-radius:16px}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line);vertical-align:top}
+th{font-size:11px;text-transform:uppercase;letter-spacing:.5px;color:var(--muted);font-weight:600;position:sticky;top:0;background:var(--glass-strong)}
+code{font:12px ui-monospace,SFMono-Regular,Menlo,monospace;background:var(--teal-soft);padding:1px 5px;border-radius:6px;word-break:break-all}
+.lbl{display:inline-block;font-size:11px;padding:1px 7px;border-radius:999px;margin:1px;border:1px solid var(--line)}
+.lbl.zombie{color:var(--crit);border-color:var(--crit)} .lbl.shadow{color:var(--violet);border-color:var(--violet)}
+.lbl.active{color:var(--ok);border-color:var(--ok)} .lbl.high-risk{color:var(--high);border-color:var(--high)}
+.lbl.unowned{color:var(--med);border-color:var(--med)}
+.timeline{padding:6px 16px;max-height:520px;overflow:auto}
+.ev{display:grid;grid-template-columns:72px 80px 1fr;gap:10px;padding:7px 0;border-bottom:1px dashed var(--line);font-size:13px}
+.ev time{color:var(--muted);font-variant-numeric:tabular-nums}
+.ev .k{font-size:11px;text-transform:uppercase;letter-spacing:.5px;color:var(--teal);font-weight:600}
+.ev .k.alarm,.ev .k.drill{color:var(--crit)} .ev .k.finding{color:var(--high)} .ev .k.retest{color:var(--ok)} .ev .k.plan{color:var(--violet)}
+@media (max-width:560px){.ev{grid-template-columns:60px 1fr}.ev .k{grid-column:2}.ev div:last-child{grid-column:1/-1}}
+.split{display:grid;gap:12px;grid-template-columns:1.2fr 1fr}
+@media (max-width:900px){.split{grid-template-columns:1fr}}
+.pad{padding:14px 16px}
+h2{font-size:14px;margin:0 0 10px}
+.muted{color:var(--muted)}
+.chain{font:12px ui-monospace,monospace}
+.toast{position:fixed;right:16px;bottom:16px;max-width:min(420px,calc(100vw - 32px));padding:12px 14px;font-size:13px;display:none;z-index:5}
+.boot{padding:40px;text-align:center}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="glass">
+    <div class="brand">
+      <svg viewBox="0 0 32 32" aria-hidden="true"><defs><linearGradient id="vg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#5eead4"/><stop offset="1" stop-color="#a78bfa"/></linearGradient></defs><path d="M16 2l12 5v8c0 8-5 13-12 15C9 28 4 23 4 15V7z" fill="url(#vg)"/><path d="M10 12l6 10 6-10" fill="none" stroke="#0b1020" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      <div><h1>Voyege Shield</h1><small>Security &amp; Fraud Shield · built on the 0security foundation</small></div>
+    </div>
+    <div class="pills" id="pills"></div>
+    <div class="row" style="display:flex;gap:6px">
+      <button class="danger" id="kill">Kill switch</button>
+      <button id="resume">Resume</button>
+      <button id="theme" title="Toggle light/dark">◐</button>
+    </div>
+  </header>
+
+  <div class="grid stats" id="stats"></div>
+
+  <div class="glass controls">
+    <div class="group"><span>Organiser deploys (signed webhook)</span>
+      <div class="row">
+        <button class="primary" data-deploy="r2.5.0">Ship r2.5.0 · refunds change</button>
+        <button data-deploy="r2.5.1">Ship r2.5.1 · refunds fix</button>
+        <button data-deploy="r2.5.2">Ship r2.5.2 · coupon + payment fix</button>
+      </div></div>
+    <div class="group"><span>Safety drills</span>
+      <div class="row">
+        <button data-drill="out_of_scope">Out-of-scope</button>
+        <button data-drill="latency">Latency spike</button>
+        <button data-drill="recorder_outage">Log outage</button>
+        <button data-drill="unsafe_write">Unsafe write</button>
+      </div></div>
+    <div class="group"><span>New host seen in DNS / CT</span>
+      <div class="row"><input type="text" id="host" value="old-b2b.tbo-legacy.example" aria-label="Hostname"><button id="addhost">Report</button></div></div>
+  </div>
+
+  <nav class="tabs" id="tabs">
+    <button data-tab="diagnose">Diagnose a URL</button>
+    <button data-tab="findings" class="on">Findings &amp; tickets</button>
+    <button data-tab="inventory">API inventory</button>
+    <button data-tab="fraud">Fraud signals</button>
+    <button data-tab="timeline">Live timeline</button>
+    <button data-tab="recorder">Flight recorder</button>
+    <button data-tab="rules">Rule catalogue</button>
+  </nav>
+
+  <section id="diagnose">
+    <div class="glass pad" style="margin-bottom:12px">
+      <h2>Diagnose a live site (read-only)</h2>
+      <p class="muted" style="margin:0 0 12px">Enter a URL. Voyege fetches it the way a browser does and checks TLS, security headers, cookie flags, version disclosure, CORS and the routes in the site's own front-end JS. It sends no attack payloads, changes nothing, and attempts no login — every request is GET at tier L0 through the safety gate.</p>
+      <div class="row" style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+        <input type="text" id="diagUrl" placeholder="https://staging.example.com" style="flex:1;min-width:220px">
+        <button class="primary" id="diagGo">Diagnose</button>
+      </div>
+      <label style="display:flex;gap:8px;align-items:flex-start;margin-top:10px;font-size:13px">
+        <input type="checkbox" id="diagAuth" style="margin-top:3px">
+        <span>I own this target or am authorised to test it. Only point Voyege at systems you are authorised to test.</span>
+      </label>
+      <div id="diagStatus" class="muted" style="margin-top:10px"></div>
+    </div>
+    <div id="diagResult"></div>
+  </section>
+
+  <section id="findings" class="on"><div class="cards" id="findingCards"></div></section>
+
+  <section id="inventory">
+    <div class="glass pad" style="margin-bottom:12px">
+      <h2>Zombie &amp; shadow endpoints: the six required fields</h2>
+      <div class="tablewrap"><table><thead><tr><th>Endpoint</th><th>Label</th><th>Last real traffic</th><th>No login?</th><th>Data exposed</th><th>vs current version</th><th>Likely owner</th><th>Recommendation</th></tr></thead><tbody id="zs"></tbody></table></div>
+    </div>
+    <div class="glass pad">
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap"><h2 style="margin:0">Endpoint graph</h2><a href="/api/openapi.json" download="voyege-openapi.json"><button>Download OpenAPI 3.1</button></a></div>
+      <div class="tablewrap" style="margin-top:10px"><table><thead><tr><th>Endpoint</th><th>Labels</th><th>Sources</th><th>30-day hits</th><th>Owner</th></tr></thead><tbody id="eps"></tbody></table></div>
+    </div>
+  </section>
+
+  <section id="fraud"><div class="cards" id="fraudCards"></div></section>
+
+  <section id="timeline">
+    <div class="split">
+      <div class="glass timeline" id="tl"></div>
+      <div class="glass pad"><h2>Latest test plan</h2><div id="plan" class="muted">No deploy yet.</div>
+        <h2 style="margin-top:16px">Alarms</h2><div id="alarms" class="muted">None.</div>
+        <h2 style="margin-top:16px">Forgotten hosts (reported, never contacted)</h2><div id="hosts" class="muted">None.</div></div>
+    </div>
+  </section>
+
+  <section id="recorder"><div class="glass pad"><div id="chain" class="chain"></div>
+    <div class="tablewrap" style="margin-top:10px"><table><thead><tr><th>#</th><th>Kind</th><th>Detail</th><th>Hash</th></tr></thead><tbody id="rec"></tbody></table></div></div></section>
+
+  <section id="rules"><div class="glass pad"><div class="tablewrap"><table><thead><tr><th>ID</th><th>Rule</th><th>Brief</th><th>Owner</th><th>Safety level</th></tr></thead><tbody id="cat"></tbody></table></div></div></section>
+</div>
+<div class="glass toast" id="toast"></div>
+
+<script>
+const $ = s => document.querySelector(s);
+const esc = v => String(v ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const inr = n => "₹" + Number(n || 0).toLocaleString("en-IN");
+const ago = ts => { const s = Math.max(0, Date.now()/1000 - ts); return s < 60 ? Math.round(s)+"s" : s < 3600 ? Math.round(s/60)+"m" : Math.round(s/3600)+"h"; };
+let tab = "findings", last = null;
+try { const t = localStorage.getItem("voyege-tab"); if (t) tab = t; const th = localStorage.getItem("voyege-theme"); if (th) document.documentElement.dataset.theme = th; } catch {}
+if (location.hash.length > 1) tab = location.hash.slice(1);
+
+function toast(msg){ const t=$("#toast"); t.textContent=msg; t.style.display="block"; clearTimeout(toast.h); toast.h=setTimeout(()=>t.style.display="none",4200); }
+async function post(url){ const r = await fetch(url,{method:"POST"}); const j = await r.json().catch(()=>({})); if(!r.ok) throw new Error(j.detail||r.status); return j; }
+
+function setTab(t){ tab=t; try{localStorage.setItem("voyege-tab",t)}catch{}
+  document.querySelectorAll("#tabs button").forEach(b=>b.classList.toggle("on",b.dataset.tab===t));
+  document.querySelectorAll("section").forEach(s=>s.classList.toggle("on",s.id===t)); if(t==="recorder") loadRecorder(); }
+$("#tabs").addEventListener("click",e=>{ if(e.target.dataset.tab) setTab(e.target.dataset.tab); });
+setTab(tab);
+
+document.querySelectorAll("[data-deploy]").forEach(b=>b.onclick=async()=>{ try{ const r=await post("/api/simulate/deploy/"+b.dataset.deploy); toast(r.accepted?`Deploy ${r.release} received; pipeline running`:"Duplicate webhook merged"); setTab("timeline"); }catch(e){toast("Error: "+e.message)} });
+document.querySelectorAll("[data-drill]").forEach(b=>b.onclick=async()=>{ try{ const r=await post("/api/drill/"+b.dataset.drill); toast(JSON.stringify(r.results||r).slice(0,300)); }catch(e){toast("Error: "+e.message)} });
+$("#kill").onclick=async()=>{ await post("/api/kill"); toast("Kill switch engaged: all agent traffic dropped"); };
+$("#resume").onclick=async()=>{ await post("/api/resume"); toast("Pipeline resumed"); };
+$("#addhost").onclick=async()=>{ const h=$("#host").value.trim(); if(!h) return; const r=await post("/api/simulate/dns/"+encodeURIComponent(h)); toast((r.events||[]).join("; ")||"Host already known"); };
+$("#theme").onclick=()=>{ const cur=document.documentElement.dataset.theme || (matchMedia("(prefers-color-scheme: dark)").matches?"dark":"light"); const nx=cur==="dark"?"light":"dark"; document.documentElement.dataset.theme=nx; try{localStorage.setItem("voyege-theme",nx)}catch{} };
+
+async function decide(id, d){ try{ await post(`/api/findings/${id}/${d}`); toast(`${id} ${d==="approve"?"confirmed and ticket sent":"rejected"}`); refresh(); }catch(e){toast("Error: "+e.message)} }
+window.decide = decide;
+
+function render(s){
+  const g=s.gate, c=g.counters, open=s.findings.filter(f=>f.status!=="closed"&&f.status!=="rejected");
+  $("#pills").innerHTML = [
+    `<span class="pill">Release <b>${esc(s.release)}</b></span>`,
+    `<span class="pill ${s.heartbeat_ok?"ok":"bad"}">Heartbeat ${s.heartbeat_age}s</span>`,
+    `<span class="pill ${g.killed||s.paused?"bad":"ok"}">${g.killed?"KILLED":s.paused?"PAUSED":"Gate live"} · rate ×${g.rate_factor.toFixed(2)}</span>`,
+    `<span class="pill ${s.recorder.ok?"ok":"bad"}">Recorder chain ${s.recorder.ok?"intact":"BROKEN"}</span>`].join("");
+  const stats=[["Open findings",open.length],["Awaiting human",s.findings.filter(f=>f.status==="awaiting_approval").length],
+    ["₹ observed (open)",inr(open.reduce((a,f)=>a+f.inr_observed,0))],["Endpoints mapped",s.inventory.length],
+    ["Zombie / shadow",s.zombie_shadow.length],["Requests forwarded",c.forwarded],["Blocked by gate",c.blocked],
+    ["Out-of-scope",c.out_of_scope],["Back-offs",c.backoffs],["Log refusals",c.log_refusals],["Recorder entries",s.recorder.records]];
+  $("#stats").innerHTML = stats.map(([k,v])=>`<div class="glass stat"><b>${esc(v)}</b><span>${esc(k)}</span></div>`).join("");
+
+  $("#findingCards").innerHTML = s.findings.length ? s.findings.map(f=>`
+    <div class="glass card">
+      <div class="meta"><span class="sev ${f.severity}">${f.severity}</span><span class="status ${f.status}">${esc(f.status.replace("_"," "))}</span><span>${esc(f.id)}</span><span>${esc(f.rule_id)}</span></div>
+      <h3>${esc(f.title)}</h3>
+      <div class="meta"><code>${esc(f.endpoint)}</code></div>
+      <div class="meta"><span>Owner <b>${esc(f.owner)}</b>${f.cc.length?" · cc "+esc(f.cc.join(", ")):""}</span><span>Score ${esc(f.formula)}</span></div>
+      <div class="meta"><span class="money">${inr(f.inr_observed)} observed</span><span class="money">${inr(f.inr_at_risk_30d)} at risk / 30 d</span><span>Seen in traffic: <b>${esc(f.seen_in_traffic.value)}</b></span></div>
+      <ul class="tight">${f.details.map(d=>`<li>${esc(d)}</li>`).join("")}</ul>
+      <div class="muted" style="font-size:13px"><b>Fix:</b> ${esc(f.fix)}</div>
+      <div class="muted" style="font-size:12px"><b>Retest:</b> ${esc(f.retest)} · trigger ${esc(f.trigger)}</div>
+      <div class="row" style="display:flex;gap:6px;flex-wrap:wrap">
+        ${f.status==="awaiting_approval"?`<button class="primary" onclick="decide('${f.id}','approve')">Confirm &amp; send ticket</button><button onclick="decide('${f.id}','reject')">Reject</button>`:""}
+        <a href="/api/tickets/${f.id}.md" target="_blank" rel="noopener"><button>Ticket (markdown)</button></a>
+      </div>
+    </div>`).join("") : `<div class="glass boot">No verified findings yet.</div>`;
+
+  $("#zs").innerHTML = s.zombie_shadow.map(r=>`<tr><td><code>${esc(r.endpoint)}</code></td><td><span class="lbl ${r.label}">${r.label}</span></td>
+    <td>${esc(r.last_real_traffic)}${r.days_since_traffic!=null?` <span class="muted">(${r.days_since_traffic} d)</span>`:""}</td>
+    <td>${r.reachable_without_auth?"<b style='color:var(--crit)'>yes</b>":"no"}</td><td>${esc(r.data_exposed.join(", "))}</td>
+    <td>${esc(r.vs_current_version)}</td><td>${esc(r.likely_owner)}</td><td><b>${esc(r.recommendation)}</b><div class="muted">${esc(r.reason)}</div></td></tr>`).join("");
+  $("#eps").innerHTML = s.inventory.map(e=>`<tr><td><code>${esc(e.key)}</code></td><td>${e.labels.map(l=>`<span class="lbl ${l}">${l}</span>`).join("")}</td>
+    <td>${esc(e.sources.join(", "))}</td><td>${e.hits_30d}</td><td>${esc(e.owner)} <span class="muted">${Math.round(e.owner_confidence*100)}%</span></td></tr>`).join("");
+
+  $("#fraudCards").innerHTML = Object.entries(s.fraud).map(([k,v])=>`<div class="glass card">
+    <div class="meta"><span class="status ${v.count?"awaiting_approval":"closed"}">${v.count?v.count+" hit(s)":"quiet"}</span><code>${esc(k)}</code></div>
+    <h3>${esc(v.desc)}</h3>${v.hits.length?`<ul class="tight">${v.hits.map(h=>`<li>${esc(Object.entries(h).map(([a,b])=>a+": "+b).join(" · "))}</li>`).join("")}</ul>`:`<div class="muted">No matching pattern in the last 90 days of logs.</div>`}</div>`).join("");
+
+  $("#tl").innerHTML = s.timeline.map(e=>`<div class="ev"><time>${ago(e.ts)} ago</time><span class="k ${e.kind}">${esc(e.kind)}</span><div>${esc(e.msg)}</div></div>`).join("");
+  const p=s.plans[0];
+  $("#plan").innerHTML = p ? `<div class="muted" style="margin-bottom:6px">Trigger ${esc(p.trigger)}</div><div class="tablewrap"><table><thead><tr><th>Rule</th><th>Level</th><th>Owner</th><th>In graph</th></tr></thead><tbody>${p.items.map(i=>`<tr><td><b>${esc(i.rule)}</b><div class="muted">${esc(i.name)}</div></td><td>${esc(i.tier)}</td><td>${esc(i.owner)}</td><td>${i.in_graph?"yes":"no"}</td></tr>`).join("")}</tbody></table></div>` : "No deploy yet.";
+  $("#alarms").innerHTML = s.alarms.length ? s.alarms.map(a=>`<div>${ago(a.ts)} ago · ${esc(a.msg)}</div>`).join("") : "None.";
+  $("#hosts").innerHTML = s.forgotten_hosts.length ? s.forgotten_hosts.map(h=>`<div><code>${esc(h.host)}</code> · ${esc(h.action)}</div>`).join("") : "None.";
+  $("#cat").innerHTML = s.catalogue.map(r=>`<tr><td><b>${esc(r.id)}</b></td><td>${esc(r.name)}</td><td class="muted">${esc(r.brief)}</td><td>${esc(r.owner)}</td><td>${esc(r.tier)}</td></tr>`).join("");
+}
+
+$("#diagGo").onclick = async () => {
+  const url = $("#diagUrl").value.trim();
+  const authorized = $("#diagAuth").checked;
+  if (!url) { $("#diagStatus").textContent = "Enter a URL."; return; }
+  if (!authorized) { $("#diagStatus").innerHTML = '<b style="color:var(--crit)">Tick the authorisation box first.</b>'; return; }
+  $("#diagGo").disabled = true; $("#diagStatus").textContent = "Scanning (read-only)…"; $("#diagResult").innerHTML = "";
+  try {
+    const r = await fetch("/api/diagnose", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({url, authorized})});
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.detail || r.status);
+    renderDiag(d); $("#diagStatus").innerHTML = `Done · <code>${esc(d.target)}</code> · recorder chain ${d.recorder.ok?"ok":"broken"}`;
+  } catch(e) { $("#diagStatus").innerHTML = `<b style="color:var(--crit)">${esc(e.message)}</b>`; }
+  finally { $("#diagGo").disabled = false; }
+};
+function renderDiag(d){
+  const sev = s => `<span class="sev ${s}">${s}</span>`;
+  const stat = [["High",d.summary.High],["Medium",d.summary.Medium],["Low",d.summary.Low],["Routes seen",d.inventory.length],["HTTPS",d.https?"yes":"NO"]];
+  $("#diagResult").innerHTML = `
+    <div class="grid stats" style="margin-bottom:12px">${stat.map(([k,v])=>`<div class="glass stat"><b>${esc(v)}</b><span>${esc(k)}</span></div>`).join("")}</div>
+    <div class="cards">${d.findings.length ? d.findings.map(f=>`
+      <div class="glass card"><div class="meta">${sev(f.severity)}<span class="status">${esc(f.method)}</span></div>
+        <h3>${esc(f.title)}</h3><div class="muted" style="font-size:13px">${esc(f.detail)}</div>
+        <div class="muted" style="font-size:13px"><b>Fix:</b> ${esc(f.fix)}</div></div>`).join("")
+      : `<div class="glass boot">No posture issues flagged. ${esc(d.note)}</div>`}</div>
+    ${d.routes_from_js.length?`<div class="glass pad" style="margin-top:12px"><h2>Routes discovered in front-end JS</h2>
+      <div style="display:flex;flex-wrap:wrap;gap:6px">${d.routes_from_js.map(r=>`<code>${esc(r)}</code>`).join("")}</div>
+      <a href="/api/diagnose/${esc(d.id)}/openapi.json" download="${esc(d.host)}-openapi.json"><button style="margin-top:10px">Download OpenAPI 3.1</button></a></div>`:""}
+    <div class="glass pad" style="margin-top:12px"><h2>Requests made (all GET, L0, through the gate)</h2>
+      <div class="tablewrap"><table><thead><tr><th>Path</th><th>Status</th><th>ms</th></tr></thead><tbody>
+      ${d.steps.map(s=>`<tr><td><code>${esc(s.path)}</code></td><td>${esc(s.status)}${s.reason?" · "+esc(s.reason):""}</td><td>${esc(s.ms??"")}</td></tr>`).join("")}</tbody></table></div>
+      <p class="muted" style="margin:8px 0 0">${esc(d.note)}</p></div>`;
+}
+async function loadRecorder(){
+  const r = await (await fetch("/api/recorder")).json();
+  $("#chain").innerHTML = r.verify.ok ? `Hash chain verified · ${r.verify.records} records · head <code>${esc(r.verify.head.slice(0,16))}…</code>` : `<b style="color:var(--crit)">Chain broken at record ${r.verify.broken_at}</b>`;
+  $("#rec").innerHTML = r.records.map(x=>`<tr><td>${x.seq}</td><td>${esc(x.kind)}</td><td><code>${esc(JSON.stringify(x.data).slice(0,180))}</code></td><td class="chain">${esc(x.hash.slice(0,12))}…</td></tr>`).join("");
+}
+
+async function refresh(){
+  try{
+    const s = await (await fetch("/api/state")).json();
+    if (s.booting){ $("#findingCards").innerHTML = `<div class="glass boot">Cold start: discovery and full sweep in progress…</div>`; return; }
+    last = s; render(s); if(tab==="recorder") loadRecorder();
+  }catch(e){ /* server restarting */ }
+}
+refresh(); setInterval(refresh, 1500);
+</script>
+</body>
+</html>

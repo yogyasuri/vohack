@@ -1,0 +1,21 @@
+# Asset ownership data (provided input). Order of evidence (PDF §8): this file -> service from gateway
+# route -> code owners -> past findings -> nearest flow owner. Confidence is recorded.
+services:
+  - {prefix: /api/v2/bookings, service: booking-svc, team: Booking, confidence: 0.95}
+  - {prefix: /api/v2/refunds, service: refunds-svc, team: Refunds, confidence: 0.95}
+  - {prefix: /api/v2/payments, service: payments-svc, team: Payments, confidence: 0.9}
+  - {prefix: /api/v2/quotes, service: pricing-svc, team: Pricing, confidence: 0.9}
+  - {prefix: /api/v2/coupons, service: promo-svc, team: Promotions, confidence: 0.85}
+  - {prefix: /api/v2/wallet, service: wallet-svc, team: Wallet, confidence: 0.9}
+  - {prefix: /api/v2/holds, service: inventory-svc, team: Inventory, confidence: 0.85}
+  - {prefix: /api/v2/search, service: search-svc, team: Search, confidence: 0.8}
+  - {prefix: /api/v2/agency, service: agency-svc, team: Agency Admin, confidence: 0.8}
+  - {prefix: /api/v2/auth, service: identity-svc, team: Identity, confidence: 0.9}
+flow_owners:
+  booking: Booking
+  refund: Refunds
+  payment: Payments
+  quote: Pricing
+  coupon: Promotions
+  wallet: Wallet
+  hold: Inventory

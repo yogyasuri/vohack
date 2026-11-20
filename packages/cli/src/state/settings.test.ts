@@ -1,0 +1,901 @@
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+import { afterEach, describe, expect, it } from "vitest";
+
+import {
+  DEFAULT_SETTINGS,
+  SETTING_DEFS,
+  describeSetting,
+  isOperatorSetting,
+  loadSettings,
+  normalizeSettings,
+  saveSettings,
+  settingsFilePath,
+  toggleSetting,
+  type SettingDef,
+  type TuiSettings,
+} from "./settings.js";
+
+/** Temp homes created by a test, torn down after it regardless of outcome. */
+const tempHomes: string[] = [];
+
+function makeHome(): string {
+  const dir = mkdtempSync(join(tmpdir(), "0-tui-settings-"));
+  tempHomes.push(dir);
+  return dir;
+}
+
+afterEach(() => {
+  while (tempHomes.length > 0) {
+    const dir = tempHomes.pop();
+    if (dir) rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+describe("settingsFilePath", () => {
+  it("places the file inside the shared 0 state directory", () => {
+    expect(settingsFilePath("/home/someone")).toBe("/home/someone/.0/tui-settings.json");
+  });
+
+  it("defaults the home directory when none is given", () => {
+    expect(settingsFilePath().endsWith(join(".0", "tui-settings.json"))).toBe(true);
+  });
+});
+
+describe("normalizeSettings", () => {
+  // The file on disk is user-editable, so "anything at all" is a realistic
+  // input, not a hypothetical: each of these must produce a usable object.
+  it.each([
+    ["null", null],
+    ["undefined", undefined],
+    ["a number", 42],
+    ["a string", "string"],
+    ["an array", []],
+    ["an empty object", {}],
+    ["a boolean", true],
+    ["a nested object with no known keys", { nope: { deep: 1 } }],
+  ])("returns the full defaults for %s", (_label, raw) => {
+    expect(normalizeSettings(raw)).toEqual(DEFAULT_SETTINGS);
+  });
+
+  it("defaults allowDevSourceUpdates off and round-trips a global toggle", () => {
+    const home = makeHome();
+    expect(loadSettings(home).allowDevSourceUpdates).toBe(false);
+    saveSettings({ ...loadSettings(home), allowDevSourceUpdates: true }, home);
+    expect(loadSettings(home).allowDevSourceUpdates).toBe(true);
+    saveSettings({ ...loadSettings(home), allowDevSourceUpdates: false }, home);
+    expect(loadSettings(home).allowDevSourceUpdates).toBe(false);
+  });
+
+  it("falls back per key when every value has the wrong type", () => {
+    const raw = {
+      showSubagents: "yes",
+      showCost: null,
+      showTokenUsage: [],
+      showContextMeter: {},
+      showTimestamps: 0,
+      density: true,
+      toolCardStyle: 7,
+    };
+
+    expect(normalizeSettings(raw)).toEqual(DEFAULT_SETTINGS);
+  });
+
+  it("drops unknown keys instead of carrying them forward", () => {
+    const normalized = normalizeSettings({
+      showSubagents: false,
+      legacyShowFooter: true,
+      showLeftSidebar: true,
+      showRightSidebar: true,
+      showAgentRail: true,
+      showstatusbar: true,
+      __proto__marker: "x",
+    });
+
+    expect(normalized).toEqual({ ...DEFAULT_SETTINGS, showSubagents: false });
+    expect(Object.keys(normalized).sort()).toEqual(Object.keys(DEFAULT_SETTINGS).sort());
+  });
+
+  it("keeps supplied values and defaults only the missing ones", () => {
+    const normalized = normalizeSettings({
+      showCost: false,
+      showTimestamps: true,
+      density: "compact",
+    });
+
+    expect(normalized.showCost).toBe(false);
+    expect(normalized.showTimestamps).toBe(true);
+    expect(normalized.density).toBe("compact");
+    // Everything not mentioned above must be untouched.
+    expect(normalized.showSubagents).toBe(DEFAULT_SETTINGS.showSubagents);
+    expect(normalized.showTokenUsage).toBe(DEFAULT_SETTINGS.showTokenUsage);
+    expect(normalized.showContextMeter).toBe(DEFAULT_SETTINGS.showContextMeter);
+    expect(normalized.toolCardStyle).toBe(DEFAULT_SETTINGS.toolCardStyle);
+  });
+
+  it("rejects an enum value outside its choices", () => {
+    const normalized = normalizeSettings({ density: "cosy", toolCardStyle: "double-line" });
+
+    expect(normalized.density).toBe(DEFAULT_SETTINGS.density);
+    expect(normalized.toolCardStyle).toBe(DEFAULT_SETTINGS.toolCardStyle);
+  });
+
+  it("queues follow-ups by default and preserves explicit interrupt preferences", () => {
+    expect(DEFAULT_SETTINGS.busyInputMode).toBe("queue");
+    expect(normalizeSettings({}).busyInputMode).toBe("queue");
+    expect(normalizeSettings({ busyInputMode: "invalid" }).busyInputMode).toBe("queue");
+    expect(normalizeSettings({ busyInputMode: "steer" }).busyInputMode).toBe("steer");
+    expect(normalizeSettings({ busyInputMode: "queue" }).busyInputMode).toBe("queue");
+  });
+
+  it("defaults transcript detail to a 20-line preview and honours a valid override", () => {
+    expect(DEFAULT_SETTINGS.transcriptDetail).toBe("collapsed");
+    expect(normalizeSettings({}).transcriptDetail).toBe("collapsed");
+    expect(normalizeSettings({ transcriptDetail: "expanded" }).transcriptDetail).toBe("expanded");
+    expect(normalizeSettings({ transcriptDetail: "collapsed" }).transcriptDetail).toBe("collapsed");
+    // A bogus value degrades to the default rather than crashing.
+    expect(normalizeSettings({ transcriptDetail: "folded" }).transcriptDetail).toBe("collapsed");
+  });
+
+  it("keeps security booleans disabled by default and accepts only explicit boolean gates", () => {
+    expect(DEFAULT_SETTINGS.allowDevSourceUpdates).toBe(false);
+    expect(normalizeSettings({
+      allowDevSourceUpdates: true,
+    })).toMatchObject({
+      allowDevSourceUpdates: true,
+    });
+    expect(normalizeSettings({
+      allowDevSourceUpdates: "yes",
+    })).toMatchObject({
+      allowDevSourceUpdates: false,
+    });
+  });
+
+  it("accepts every declared choice for every enum setting", () => {
+    for (const def of SETTING_DEFS) {
+      if (def.kind !== "enum") continue;
+      for (const choice of def.choices ?? []) {
+        const normalized = normalizeSettings({ [def.key]: choice }) as unknown as Record<
+          string,
+          unknown
+        >;
+        expect(normalized[def.key]).toBe(choice);
+      }
+    }
+  });
+
+  it("does not mutate its input", () => {
+    const raw = { showSubagents: false, density: "bogus", extra: 1 };
+    const snapshot = JSON.parse(JSON.stringify(raw));
+
+    normalizeSettings(raw);
+
+    expect(raw).toEqual(snapshot);
+  });
+
+  it("returns a fresh object rather than DEFAULT_SETTINGS itself", () => {
+    const normalized = normalizeSettings(null);
+
+    expect(normalized).not.toBe(DEFAULT_SETTINGS);
+    normalized.showSubagents = !normalized.showSubagents;
+    expect(DEFAULT_SETTINGS.showSubagents).toBe(true);
+  });
+});
+
+describe("loadSettings / saveSettings", () => {
+  it("round-trips a settings object through the file", () => {
+    const home = makeHome();
+    const settings: TuiSettings = {
+      ...DEFAULT_SETTINGS,
+      showSubagents: false,
+      showTimestamps: true,
+      density: "compact",
+      toolCardStyle: "inline",
+    };
+
+    expect(saveSettings(settings, home)).toBe(true);
+    expect(loadSettings(home)).toEqual(settings);
+  });
+
+  it("writes pretty-printed JSON with a trailing newline", () => {
+    const home = makeHome();
+
+    saveSettings(DEFAULT_SETTINGS, home);
+    const text = readText(settingsFilePath(home));
+
+    expect(text.endsWith("}\n")).toBe(true);
+    expect(text).toContain('\n  "showSubagents": true,');
+  });
+
+  it("creates the state directory when it does not exist yet", () => {
+    const home = join(makeHome(), "nested", "home");
+
+    expect(saveSettings(DEFAULT_SETTINGS, home)).toBe(true);
+    expect(loadSettings(home)).toEqual(DEFAULT_SETTINGS);
+  });
+
+  it("returns defaults, without throwing, when nothing has been saved", () => {
+    const home = join(makeHome(), "never-created");
+
+    expect(() => loadSettings(home)).not.toThrow();
+    expect(loadSettings(home)).toEqual(DEFAULT_SETTINGS);
+  });
+
+  it("returns defaults, without throwing, on invalid JSON", () => {
+    const home = makeHome();
+    mkdirSync(join(home, ".0"), { recursive: true });
+    writeFileSync(settingsFilePath(home), "{ this is not json, ", "utf8");
+
+    expect(() => loadSettings(home)).not.toThrow();
+    expect(loadSettings(home)).toEqual(DEFAULT_SETTINGS);
+  });
+
+  it("returns defaults when the file holds valid JSON of the wrong shape", () => {
+    const home = makeHome();
+    mkdirSync(join(home, ".0"), { recursive: true });
+    writeFileSync(settingsFilePath(home), '["showSubagents"]', "utf8");
+
+    expect(loadSettings(home)).toEqual(DEFAULT_SETTINGS);
+  });
+
+  it("returns false instead of throwing when the path cannot be created", () => {
+    // A regular file standing where a parent directory would have to be makes
+    // mkdir fail with ENOTDIR — the cheap, portable stand-in for a home the
+    // process may not write to.
+    const blocker = join(makeHome(), "not-a-directory");
+    writeFileSync(blocker, "occupied", "utf8");
+    const home = join(blocker, "home");
+
+    expect(() => saveSettings(DEFAULT_SETTINGS, home)).not.toThrow();
+    expect(saveSettings(DEFAULT_SETTINGS, home)).toBe(false);
+  });
+
+  it("normalises on the way out, so a corrupt in-memory object cannot be persisted", () => {
+    const home = makeHome();
+    const corrupt = { showSubagents: "nope", density: "cosy", stray: 1 } as unknown as TuiSettings;
+
+    expect(saveSettings(corrupt, home)).toBe(true);
+    expect(loadSettings(home)).toEqual(DEFAULT_SETTINGS);
+    expect(readText(settingsFilePath(home))).not.toContain("stray");
+  });
+});
+
+describe("toggleSetting", () => {
+  it("flips a boolean setting", () => {
+    const on = { ...DEFAULT_SETTINGS, showSubagents: true };
+
+    const off = toggleSetting(on, "showSubagents");
+    expect(off.showSubagents).toBe(false);
+    expect(toggleSetting(off, "showSubagents").showSubagents).toBe(true);
+  });
+
+  it("leaves the other settings alone when flipping one", () => {
+    const next = toggleSetting(DEFAULT_SETTINGS, "showCost");
+
+    expect({ ...next, showCost: DEFAULT_SETTINGS.showCost }).toEqual(DEFAULT_SETTINGS);
+  });
+
+  it("cycles a two-value enum and wraps", () => {
+    const a = toggleSetting(DEFAULT_SETTINGS, "density");
+    expect(a.density).toBe("compact");
+
+    const b = toggleSetting(a, "density");
+    expect(b.density).toBe("comfortable");
+  });
+
+  it("cycles a four-value enum and wraps", () => {
+    const one = toggleSetting(DEFAULT_SETTINGS, "toolCardStyle");
+    const two = toggleSetting(one, "toolCardStyle");
+    const three = toggleSetting(two, "toolCardStyle");
+    const four = toggleSetting(three, "toolCardStyle");
+
+    expect([one.toolCardStyle, two.toolCardStyle, three.toolCardStyle, four.toolCardStyle]).toEqual([
+      "rail",
+      "inline",
+      "hidden",
+      "compact",
+    ]);
+  });
+
+  it("returns the input unchanged for an unknown key", () => {
+    expect(toggleSetting(DEFAULT_SETTINGS, "showFooter")).toBe(DEFAULT_SETTINGS);
+    expect(toggleSetting(DEFAULT_SETTINGS, "")).toBe(DEFAULT_SETTINGS);
+    expect(toggleSetting(DEFAULT_SETTINGS, "toString")).toBe(DEFAULT_SETTINGS);
+  });
+
+  it("repairs an enum value that is not in the choice list", () => {
+    const corrupt = { ...DEFAULT_SETTINGS, toolCardStyle: "neon" as TuiSettings["toolCardStyle"] };
+
+    expect(toggleSetting(corrupt, "toolCardStyle").toolCardStyle).toBe("compact");
+  });
+
+  it("does not mutate its input", () => {
+    const before = { ...DEFAULT_SETTINGS };
+    const snapshot = { ...before };
+
+    toggleSetting(before, "showSubagents");
+    toggleSetting(before, "density");
+
+    expect(before).toEqual(snapshot);
+  });
+
+  it("returns every setting to its starting value after a full cycle", () => {
+    for (const def of SETTING_DEFS) {
+      const steps = def.kind === "boolean" ? 2 : (def.choices?.length ?? 0);
+      let settings = DEFAULT_SETTINGS;
+      for (let i = 0; i < steps; i += 1) settings = toggleSetting(settings, def.key);
+
+      expect(settings).toEqual(DEFAULT_SETTINGS);
+    }
+  });
+});
+
+describe("describeSetting", () => {
+  it("renders booleans as on/off with the label and description", () => {
+    const text = describeSetting(DEFAULT_SETTINGS, "showSubagents");
+
+    expect(text).toContain("Subagent list");
+    expect(text).toContain("on");
+    expect(describeSetting({ ...DEFAULT_SETTINGS, showSubagents: false }, "showSubagents")).toContain(
+      "off",
+    );
+  });
+
+  it("renders the current enum value", () => {
+    expect(describeSetting({ ...DEFAULT_SETTINGS, density: "compact" }, "density")).toContain(
+      "compact",
+    );
+  });
+
+  it("returns an empty string for an unknown key rather than throwing", () => {
+    expect(describeSetting(DEFAULT_SETTINGS, "nope")).toBe("");
+  });
+
+  it("produces a single line for every declared setting", () => {
+    for (const def of SETTING_DEFS) {
+      const text = describeSetting(DEFAULT_SETTINGS, def.key);
+      expect(text.length).toBeGreaterThan(0);
+      expect(text).not.toContain("\n");
+    }
+  });
+});
+
+describe("subagent messaging settings", () => {
+  // These two are the only settings that gate a security boundary rather than
+  // chrome, so they get their own assertions: the shipped default, the group
+  // they surface under, and a description an operator can act on.
+  const CHANNEL_KEYS = ["allowSubagentPeerMessaging", "allowSubagentOperatorMessaging"] as const;
+
+  it("ships both subagent messaging channels ON", () => {
+    for (const key of CHANNEL_KEYS) {
+      expect(DEFAULT_SETTINGS[key]).toBe(true);
+    }
+  });
+
+  it("files both channels under Security", () => {
+    for (const key of CHANNEL_KEYS) {
+      const def = SETTING_DEFS.find((d) => d.key === key);
+      expect(def?.group).toBe("Security");
+      expect(def?.kind).toBe("boolean");
+    }
+  });
+
+
+  it("toggles each channel off and back on", () => {
+    for (const key of CHANNEL_KEYS) {
+      const off = toggleSetting(DEFAULT_SETTINGS, key);
+      expect(off[key]).toBe(false);
+      expect(toggleSetting(off, key)[key]).toBe(true);
+    }
+  });
+
+  it("round-trips a disabled channel through save and load", () => {
+    const home = makeHome();
+    const disabled: TuiSettings = {
+      ...DEFAULT_SETTINGS,
+      allowSubagentPeerMessaging: false,
+      allowSubagentOperatorMessaging: false,
+    };
+
+    expect(saveSettings(disabled, home)).toBe(true);
+    const loaded = loadSettings(home);
+    expect(loaded.allowSubagentPeerMessaging).toBe(false);
+    expect(loaded.allowSubagentOperatorMessaging).toBe(false);
+  });
+});
+
+describe("SETTING_DEFS", () => {
+
+  it("has a field for every def", () => {
+    for (const def of SETTING_DEFS) {
+      expect(Object.prototype.hasOwnProperty.call(DEFAULT_SETTINGS, def.key)).toBe(true);
+    }
+  });
+
+
+  it("declares each key exactly once", () => {
+    const keys = SETTING_DEFS.map((def) => def.key);
+
+    expect(new Set(keys).size).toBe(keys.length);
+  });
+
+  it("agrees with DEFAULT_SETTINGS on every default value", () => {
+    const defaults = DEFAULT_SETTINGS as unknown as Record<string, unknown>;
+
+    for (const def of SETTING_DEFS) {
+      expect(def.default).toEqual(defaults[def.key]);
+    }
+  });
+
+  it("gives every def a label, description and group", () => {
+    for (const def of SETTING_DEFS) {
+      expect(def.label.length).toBeGreaterThan(0);
+      expect(def.description.length).toBeGreaterThan(0);
+      expect(def.group.length).toBeGreaterThan(0);
+    }
+  });
+
+  it("gives enums at least two choices including their default, and booleans none", () => {
+    for (const def of SETTING_DEFS as readonly SettingDef[]) {
+      if (def.kind === "enum") {
+        expect(def.choices?.length ?? 0).toBeGreaterThanOrEqual(2);
+        expect(def.choices).toContain(def.default);
+        expect(typeof def.default).toBe("string");
+      } else if (def.kind === "number") {
+        expect(def.choices).toBeUndefined();
+        expect(def.default).toBeGreaterThanOrEqual(def.min!);
+        expect(def.default).toBeLessThanOrEqual(def.max!);
+      } else if (def.kind === "text") {
+        expect(def.choices).toBeUndefined();
+        expect(typeof def.default).toBe("string");
+      } else {
+        expect(def.choices).toBeUndefined();
+        expect(typeof def.default).toBe("boolean");
+      }
+    }
+  });
+
+});
+
+/** Reads back a file the tests just wrote. */
+function readText(path: string): string {
+  return readFileSync(path, "utf8");
+}
+
+// ── Two-level configuration (global + project override) ───────────────────────
+
+import { mkdtempSync as mkdtempSync2 } from "node:fs";
+import {
+  loadGlobalSettings,
+  loadLayeredSettings,
+  projectSettingsExist,
+  projectSettingsFilePath,
+  readProjectOverrides,
+  resolveLayeredSettings,
+  sanitizeOverrides,
+  saveProjectOverrides,
+} from "./settings.js";
+function makeProjectDir(): string {
+  const dir = mkdtempSync2(join(tmpdir(), "0-project-"));
+  tempHomes.push(dir);
+  return dir;
+}
+
+function writeGlobalFull(home: string, settings: TuiSettings): void {
+  saveSettings(settings, home);
+}
+function writeProjectRaw(projectDir: string, raw: unknown): void {
+  const path = projectSettingsFilePath(projectDir);
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, typeof raw === "string" ? raw : JSON.stringify(raw), "utf8");
+}
+
+// dirname is needed above.
+import { dirname } from "node:path";
+
+
+describe("public analytics consent", () => {
+  it("defaults fresh installations to usage metrics and automatic crash reports", () => {
+    const home = makeHome();
+    const project = makeProjectDir();
+    const { settings, sources } = loadLayeredSettings({ homeDir: home, projectDir: project });
+    expect(DEFAULT_SETTINGS.analyticsLevel).toBe("usage");
+    expect(settings.analyticsLevel).toBe("usage");
+    expect(DEFAULT_SETTINGS.diagnosticReporting).toBe("automatic");
+    expect(settings.diagnosticReporting).toBe("automatic");
+    expect(settings.diagnosticReportingPrompted).toBe(false);
+    expect(sources.analyticsLevel).toBe("default");
+    expect(sources.diagnosticReporting).toBe("default");
+  });
+
+  it("narrows legacy content-sharing consent on load and persists only usage", () => {
+    const home = makeHome();
+    const project = makeProjectDir();
+    mkdirSync(dirname(settingsFilePath(home)), { recursive: true });
+    writeFileSync(settingsFilePath(home), JSON.stringify({ analyticsLevel: "commands" }));
+    writeProjectRaw(project, { analyticsLevel: "full" });
+    const migrated = loadLayeredSettings({ homeDir: home, projectDir: project });
+    expect(migrated.settings.analyticsLevel).toBe("usage");
+    expect(migrated.sources.analyticsLevel).toBe("global");
+    expect(normalizeSettings({ analyticsLevel: "full" }).analyticsLevel).toBe("usage");
+    saveSettings(migrated.settings, home);
+    expect(JSON.parse(readFileSync(settingsFilePath(home), "utf8")).analyticsLevel).toBe("usage");
+    const optedOut = toggleSetting(migrated.settings, "analyticsLevel");
+    expect(optedOut.analyticsLevel).toBe("off");
+    expect(toggleSetting(optedOut, "analyticsLevel").analyticsLevel).toBe("usage");
+  });
+});
+describe("diagnosticReporting default migration", () => {
+  const writeGlobal = (home: string, raw: unknown) => {
+    mkdirSync(dirname(settingsFilePath(home)), { recursive: true });
+    writeFileSync(settingsFilePath(home), JSON.stringify(raw));
+  };
+
+  it("keeps an explicit stored off", () => {
+    const home = makeHome();
+    writeGlobal(home, { diagnosticReporting: "off" });
+    expect(loadLayeredSettings({ homeDir: home }).settings.diagnosticReporting).toBe("off");
+    expect(loadGlobalSettings(home).diagnosticReporting).toBe("off");
+  });
+
+  it("keeps an explicit stored automatic", () => {
+    const home = makeHome();
+    writeGlobal(home, { diagnosticReporting: "automatic" });
+    expect(loadLayeredSettings({ homeDir: home }).settings.diagnosticReporting).toBe("automatic");
+  });
+
+  it("keeps a stored ask that is marked as an explicit choice (diagnosticReportingPrompted true)", () => {
+    const home = makeHome();
+    writeGlobal(home, { diagnosticReporting: "ask", diagnosticReportingPrompted: true });
+    const { settings, sources } = loadLayeredSettings({ homeDir: home });
+    expect(settings.diagnosticReporting).toBe("ask");
+    expect(sources.diagnosticReporting).toBe("global");
+    expect(loadGlobalSettings(home).diagnosticReporting).toBe("ask");
+  });
+
+  it("migrates a stored ask from the old default (no explicit-choice marker) to the new default", () => {
+    const home = makeHome();
+    writeGlobal(home, { diagnosticReporting: "ask", diagnosticReportingPrompted: false, showCost: false });
+    const { settings, sources } = loadLayeredSettings({ homeDir: home });
+    expect(settings.diagnosticReporting).toBe("automatic");
+    expect(sources.diagnosticReporting).toBe("default");
+    expect(loadGlobalSettings(home).diagnosticReporting).toBe("automatic");
+    expect(settings.showCost).toBe(false);
+    writeGlobal(home, { diagnosticReporting: "ask" });
+    expect(loadLayeredSettings({ homeDir: home }).settings.diagnosticReporting).toBe("automatic");
+  });
+
+  it("a fresh install and a file without the key both resolve to automatic", () => {
+    const home = makeHome();
+    expect(loadSettings(home).diagnosticReporting).toBe("automatic");
+    writeGlobal(home, { showCost: true });
+    expect(loadSettings(home).diagnosticReporting).toBe("automatic");
+  });
+
+  it("choosing ask is persisted as explicit and survives the next load and save", () => {
+    const home = makeHome();
+    expect(saveSettings({ ...loadGlobalSettings(home), diagnosticReporting: "ask" }, home)).toBe(true);
+    const onDisk = JSON.parse(readFileSync(settingsFilePath(home), "utf8"));
+    expect(onDisk.diagnosticReporting).toBe("ask");
+    expect(onDisk.diagnosticReportingPrompted).toBe(true);
+    expect(loadSettings(home).diagnosticReporting).toBe("ask");
+    saveSettings({ ...loadGlobalSettings(home), showCost: false }, home);
+    expect(loadSettings(home).diagnosticReporting).toBe("ask");
+  });
+
+  it("saving unrelated settings on a migrated install does not resurrect ask", () => {
+    const home = makeHome();
+    writeGlobal(home, { diagnosticReporting: "ask" });
+    saveSettings({ ...loadGlobalSettings(home), showCost: false }, home);
+    expect(loadSettings(home).diagnosticReporting).toBe("automatic");
+    expect(JSON.parse(readFileSync(settingsFilePath(home), "utf8")).diagnosticReporting).toBe("automatic");
+  });
+
+  it("an explicit analyticsLevel off is preserved while crash reports migrate", () => {
+    const home = makeHome();
+    writeGlobal(home, { analyticsLevel: "off", diagnosticReporting: "ask" });
+    const settings = loadSettings(home);
+    expect(settings.analyticsLevel).toBe("off");
+    expect(settings.diagnosticReporting).toBe("automatic");
+  });
+});
+describe("operator-only privacy and updates", () => {
+  it("does not let a project override reporting policy or hide unanswered onboarding", () => {
+    const home = makeHome();
+    const project = makeProjectDir();
+    writeProjectRaw(project, {
+      diagnosticReporting: "off",
+      diagnosticReportingPrompted: true,
+      updatePolicy: "off",
+      allowDevSourceUpdates: true,
+      showCost: false,
+    });
+    const { settings, sources } = loadLayeredSettings({ homeDir: home, projectDir: project });
+    expect(settings.diagnosticReportingPrompted).toBe(false);
+    expect(settings.updatePolicy).toBe("automatic");
+    expect(settings.allowDevSourceUpdates).toBe(false);
+    expect(sources.diagnosticReporting).toBe("default");
+    expect(sources.updatePolicy).toBe("default");
+    expect(sources.allowDevSourceUpdates).toBe("default");
+    expect(settings.showCost).toBe(false);
+  });
+
+  it.each([false, "off"] as const)("preserves an explicit global %s opt-out with global provenance", (choice) => {
+    const home = makeHome();
+    const project = makeProjectDir();
+    mkdirSync(dirname(settingsFilePath(home)), { recursive: true });
+    writeFileSync(settingsFilePath(home), JSON.stringify({
+      analyticsLevel: choice,
+      diagnosticReporting: choice,
+      diagnosticReportingPrompted: false,
+      updatePolicy: false,
+      allowDevSourceUpdates: true,
+    }));
+    writeProjectRaw(project, {
+      diagnosticReporting: "automatic",
+      analyticsLevel: "full",
+      diagnosticReportingPrompted: true,
+      updatePolicy: "automatic",
+      allowDevSourceUpdates: false,
+    });
+    const { settings, sources } = loadLayeredSettings({ homeDir: home, projectDir: project });
+    expect(settings.diagnosticReporting).toBe("off");
+    expect(settings.analyticsLevel).toBe("off");
+    expect(settings.diagnosticReportingPrompted).toBe(false);
+    expect(settings.updatePolicy).toBe("off");
+    expect(settings.allowDevSourceUpdates).toBe(true);
+    expect(sources.diagnosticReporting).toBe("global");
+    expect(sources.analyticsLevel).toBe("global");
+    expect(sources.updatePolicy).toBe("global");
+    expect(sources.allowDevSourceUpdates).toBe("global");
+  });
+
+  it("persists an operator choice without allowing project consent overrides", () => {
+    const home = makeHome();
+    const project = makeProjectDir();
+    saveSettings({
+      ...DEFAULT_SETTINGS,
+      allowDevSourceUpdates: true,
+      diagnosticReporting: "ask",
+      diagnosticReportingPrompted: true,
+      updatePolicy: "notify",
+    }, home);
+    writeProjectRaw(project, {
+      diagnosticReporting: "automatic",
+      diagnosticReportingPrompted: false,
+      updatePolicy: "automatic",
+      allowDevSourceUpdates: false,
+    });
+    const settings = loadSettings(home, project);
+    expect(settings.allowDevSourceUpdates).toBe(true);
+    expect(settings.diagnosticReporting).toBe("ask");
+    expect(settings.diagnosticReportingPrompted).toBe(true);
+    expect(settings.updatePolicy).toBe("notify");
+    saveSettings({ ...settings, allowDevSourceUpdates: false, diagnosticReporting: "automatic", updatePolicy: "automatic" }, home);
+    writeProjectRaw(project, { allowDevSourceUpdates: true, diagnosticReporting: "off", updatePolicy: "off" });
+    expect(loadSettings(home, project).allowDevSourceUpdates).toBe(false);
+    expect(loadSettings(home, project).diagnosticReporting).toBe("automatic");
+    expect(loadSettings(home, project).updatePolicy).toBe("automatic");
+  });
+
+  it("keeps the execution boundary operator-global in both directions", () => {
+    const home = makeHome();
+    const project = makeProjectDir();
+    saveSettings({ ...DEFAULT_SETTINGS, executionProfile: "smolvm" }, home);
+    writeProjectRaw(project, { executionProfile: "local" });
+    const isolated = loadLayeredSettings({ homeDir: home, projectDir: project });
+    expect(isolated.settings.executionProfile).toBe("smolvm");
+    expect(isolated.sources.executionProfile).toBe("global");
+    saveSettings({ ...DEFAULT_SETTINGS, executionProfile: "local" }, home);
+    writeProjectRaw(project, { executionProfile: "smolvm" });
+    expect(loadSettings(home, project).executionProfile).toBe("local");
+    expect(sanitizeOverrides({ executionProfile: "smolvm", showCost: false })).toEqual({ showCost: false });
+  });
+
+  it("rejects project permission writes without changing existing project settings", async () => {
+    const project = makeProjectDir();
+    saveProjectOverrides({ showCost: false }, project);
+    const { setProjectOverride } = await import("./settings.js");
+    expect(setProjectOverride("diagnosticReporting", "automatic", project)).toBe(false);
+    expect(setProjectOverride("diagnosticReportingPrompted", true, project)).toBe(false);
+    // Usage sharing is an independent operator-owned egress grant.
+    expect(setProjectOverride("analyticsLevel", "usage", project)).toBe(false);
+    expect(setProjectOverride("updatePolicy", "automatic", project)).toBe(false);
+    expect(setProjectOverride("allowDevSourceUpdates", true, project)).toBe(false);
+    expect(setProjectOverride("executionProfile", "local", project)).toBe(false);
+    expect(readProjectOverrides(project)).toEqual({ showCost: false });
+  });
+
+});
+
+describe("two-level layering", () => {
+  it("global-only: every key comes from the global file", () => {
+    const home = makeHome();
+    const project = makeProjectDir();
+    writeGlobalFull(home, { ...DEFAULT_SETTINGS, showCost: false, density: "compact" });
+
+    const { settings, sources } = loadLayeredSettings({ homeDir: home, projectDir: project });
+    expect(settings.showCost).toBe(false);
+    expect(settings.density).toBe("compact");
+    expect(sources.showCost).toBe("global");
+    expect(sources.showTimestamps).toBe("global"); // present in the full global file
+  });
+
+  it("project overrides global per key; unset keys fall through", () => {
+    const home = makeHome();
+    const project = makeProjectDir();
+    writeGlobalFull(home, { ...DEFAULT_SETTINGS, showCost: false, showSubagents: false });
+    writeProjectRaw(project, { showCost: true, density: "compact" });
+
+    const { settings, sources } = loadLayeredSettings({ homeDir: home, projectDir: project });
+    expect(settings.showCost).toBe(true); // project wins
+    expect(sources.showCost).toBe("project");
+    expect(settings.density).toBe("compact");
+    expect(sources.density).toBe("project");
+    expect(settings.showSubagents).toBe(false); // falls through to global
+    expect(sources.showSubagents).toBe("global");
+  });
+
+  it("corrupt project file falls through to global entirely", () => {
+    const home = makeHome();
+    const project = makeProjectDir();
+    writeGlobalFull(home, { ...DEFAULT_SETTINGS, showCost: false });
+    writeProjectRaw(project, "{ not json ,,");
+
+    const { settings, sources } = loadLayeredSettings({ homeDir: home, projectDir: project });
+    expect(settings.showCost).toBe(false);
+    expect(sources.showCost).toBe("global");
+  });
+
+  it("an invalid project value for one key falls through, not to default", () => {
+    const home = makeHome();
+    const project = makeProjectDir();
+    writeGlobalFull(home, { ...DEFAULT_SETTINGS, density: "compact" });
+    writeProjectRaw(project, { density: "cosy" }); // invalid enum
+
+    const { settings, sources } = loadLayeredSettings({ homeDir: home, projectDir: project });
+    expect(settings.density).toBe("compact"); // global, not the default
+    expect(sources.density).toBe("global");
+  });
+
+  it("defaults win when neither layer has a valid key", () => {
+    const home = join(makeHome(), "empty");
+    const project = makeProjectDir();
+    const { settings, sources } = loadLayeredSettings({ homeDir: home, projectDir: project });
+    expect(settings).toEqual(DEFAULT_SETTINGS);
+    for (const key of Object.keys(DEFAULT_SETTINGS)) {
+      expect(sources[key as keyof TuiSettings]).toBe("default");
+    }
+  });
+
+  it("resolveLayeredSettings is pure and total on garbage layers", () => {
+    expect(() => resolveLayeredSettings(null, 42)).not.toThrow();
+    expect(resolveLayeredSettings(null, 42).settings).toEqual(DEFAULT_SETTINGS);
+  });
+
+  it("projectSettingsExist reflects a present, object-shaped override", () => {
+    const project = makeProjectDir();
+    expect(projectSettingsExist(project)).toBe(false);
+    writeProjectRaw(project, { showCost: true });
+    expect(projectSettingsExist(project)).toBe(true);
+    writeProjectRaw(project, "[]"); // array is not layerable
+    expect(projectSettingsExist(project)).toBe(false);
+  });
+});
+
+describe("project override writes", () => {
+  it("sanitizeOverrides keeps known valid keys and drops the rest, sparsely", () => {
+    const patch = sanitizeOverrides({ showCost: false, density: "compact", nope: 1, showSubagents: "x" });
+    expect(patch).toEqual({ showCost: false, density: "compact" });
+  });
+
+  it("drops operator-only allowDevSourceUpdates from project overrides", () => {
+    const patch = sanitizeOverrides({ allowDevSourceUpdates: true, showCost: false });
+    expect(patch).toEqual({ showCost: false });
+  });
+
+  it("round-trips a sparse project override", () => {
+    const project = makeProjectDir();
+    expect(saveProjectOverrides({ showCost: false }, project)).toBe(true);
+    expect(readProjectOverrides(project)).toEqual({ showCost: false });
+  });
+});
+
+describe("loadGlobalSettings", () => {
+  it("reads only the global layer, ignoring a project override", () => {
+    const home = makeHome();
+    const project = makeProjectDir();
+    writeGlobalFull(home, { ...DEFAULT_SETTINGS, showCost: false });
+    writeProjectRaw(project, { showCost: true });
+    expect(loadGlobalSettings(home).showCost).toBe(false);
+  });
+
+  it("refuses corrupt or absent execution selection when a configured workbench requires an explicit choice", () => {
+    const home = makeHome();
+    expect(() => loadGlobalSettings(home, { requireExecutionProfile: true })).toThrow();
+    saveSettings({ ...DEFAULT_SETTINGS, executionProfile: "smolvm" }, home);
+    expect(loadGlobalSettings(home, { requireExecutionProfile: true }).executionProfile).toBe("smolvm");
+    writeFileSync(settingsFilePath(home), "{broken");
+    expect(() => loadGlobalSettings(home, { requireExecutionProfile: true })).toThrow();
+    saveSettings({ ...DEFAULT_SETTINGS, executionProfile: "local" }, home);
+    expect(loadGlobalSettings(home, { requireExecutionProfile: true }).executionProfile).toBe("local");
+  });
+});
+
+
+describe("removed terminal-only settings", () => {
+  const REMOVED = {
+    showStatusBar: false, showComposerHints: false, composerSuggestions: false, mouseSupport: false,
+    showLogo: false, logoAnimation: "off", symbolPreset: "ascii", leaderKey: "ctrl+a",
+    showRuntimeNotices: false, showObjective: false, showScope: false, composerStyle: "plain",
+    transcriptStyle: "rail", roleLabelStyle: "full", rosterSort: "status", richToolCards: false,
+    modelDisplay: "off", showTurnSummary: true, autoEvolveFinderLenses: true,
+    autoPromoteFinderLenses: true, theme: "dark", keybindings: { "view.transcript-detail": "ctrl+j" },
+  };
+
+  it("ignores removed keys on load without disturbing kept ones", () => {
+    const home = makeHome();
+    mkdirSync(join(home, ".0"), { recursive: true });
+    writeFileSync(settingsFilePath(home), JSON.stringify({ ...REMOVED, density: "compact", showCost: false }), "utf8");
+    const loaded = loadSettings(home);
+    expect(loaded).toEqual({ ...DEFAULT_SETTINGS, density: "compact", showCost: false });
+    for (const key of Object.keys(REMOVED)) expect(key in loaded, key).toBe(false);
+  });
+
+  it("does not write removed keys back on save", () => {
+    const home = makeHome();
+    mkdirSync(join(home, ".0"), { recursive: true });
+    writeFileSync(settingsFilePath(home), JSON.stringify({ ...REMOVED, density: "compact" }), "utf8");
+    expect(saveSettings(loadSettings(home), home)).toBe(true);
+    const onDisk = JSON.parse(readFileSync(settingsFilePath(home), "utf8")) as Record<string, unknown>;
+    for (const key of Object.keys(REMOVED)) expect(key in onDisk, key).toBe(false);
+    expect(onDisk.density).toBe("compact");
+  });
+
+  it("is no longer a declared setting", () => {
+    for (const key of Object.keys(REMOVED)) {
+      expect(SETTING_DEFS.some((d) => d.key === key), key).toBe(false);
+      expect(toggleSetting(DEFAULT_SETTINGS, key)).toBe(DEFAULT_SETTINGS);
+    }
+  });
+});
+
+describe("thread and subagent settings", () => {
+  const layered = (globalRaw: unknown, projectRaw: unknown) => resolveLayeredSettings(globalRaw, projectRaw);
+
+  it("defaults to today's engine limits", () => {
+    expect(DEFAULT_SETTINGS).toMatchObject({ subagentConcurrency: 32, subagentMaxDepth: 8, subagentFanOut: 1024, titleInstructions: "", archiveIdleDays: 0 });
+  });
+
+  it("clamps, rounds and rejects numbers", () => {
+    expect(normalizeSettings({ subagentConcurrency: 9999, subagentMaxDepth: 0, subagentFanOut: 2.6, archiveIdleDays: -4 })).toMatchObject({ subagentConcurrency: 128, subagentMaxDepth: 1, subagentFanOut: 3, archiveIdleDays: 0 });
+    expect(normalizeSettings({ subagentConcurrency: "8", subagentMaxDepth: Number.NaN })).toMatchObject({ subagentConcurrency: 32, subagentMaxDepth: 8 });
+  });
+
+  it("trims, strips control characters and caps title instructions", () => {
+    expect(normalizeSettings({ titleInstructions: "  Use German\u0000\u0007  " }).titleInstructions).toBe("Use German");
+    expect(normalizeSettings({ titleInstructions: "x".repeat(900) }).titleInstructions).toHaveLength(500);
+    expect(normalizeSettings({ titleInstructions: 5 }).titleInstructions).toBe("");
+  });
+
+  it("lets a project lower but never raise subagent limits", () => {
+    const lowered = layered({ subagentConcurrency: 16 }, { subagentConcurrency: 4, subagentMaxDepth: 99, subagentFanOut: 2000 });
+    expect(lowered.settings).toMatchObject({ subagentConcurrency: 4, subagentMaxDepth: 8, subagentFanOut: 1024 });
+    expect(lowered.sources.subagentConcurrency).toBe("project");
+    expect(lowered.sources.subagentMaxDepth).toBe("default");
+    expect(layered({ subagentConcurrency: 16 }, { subagentConcurrency: 64 }).settings.subagentConcurrency).toBe(16);
+  });
+
+  it("keeps idle archiving operator-only", () => {
+    expect(isOperatorSetting("archiveIdleDays")).toBe(true);
+    expect(layered({ archiveIdleDays: 30 }, { archiveIdleDays: 1 }).settings.archiveIdleDays).toBe(30);
+    expect(sanitizeOverrides({ archiveIdleDays: 1, titleInstructions: "Short" })).toEqual({ titleInstructions: "Short" });
+  });
+
+  it("ignores toggling and describes the new kinds", () => {
+    expect(toggleSetting(DEFAULT_SETTINGS, "subagentConcurrency")).toBe(DEFAULT_SETTINGS);
+    expect(describeSetting(DEFAULT_SETTINGS, "titleInstructions")).toContain("Title instructions");
+  });
+});

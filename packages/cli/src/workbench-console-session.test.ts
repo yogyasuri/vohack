@@ -1,0 +1,288 @@
+import { mkdtemp, mkdir, rm, readdir, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { realpathSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+const mock = vi.hoisted(() => ({ sourceOnClose: undefined as unknown, lessonOnClose: undefined as unknown, destroyed: false, holdReady: false, holdSend: false, holdAutonomy: false, autonomyError: undefined as string | undefined, releaseAutonomy: undefined as (() => void) | undefined, cleanupFailed: false, sendError: undefined as string | undefined, serviceConnections: [] as Array<{id:string;enabled:boolean;fields:Record<string,string>}>, pluginDirectory: undefined as string | undefined, pluginCleanup: vi.fn(async () => {}), launches: [] as unknown[], requests: [] as Record<string, unknown>[], output: undefined as ((data: string) => void) | undefined }));
+vi.mock("@0/engine", () => ({
+  DEFAULT_MAX_TOOL_ITERATIONS: 100,
+  runSmolvmWorkbench: (options: { signal: AbortSignal; onStartupProgress?: (message: string) => void; transport: { initialInput: string; onStdout(data: string): void; onReady(input: { write(data: string): void; end(): void }): void } }) => {
+    mock.launches.push(options); mock.output = options.transport.onStdout;
+    const init = JSON.parse(options.transport.initialInput);
+    const emit = (frame: unknown) => options.transport.onStdout(JSON.stringify(frame) + "\n");
+    return new Promise(resolve => {
+      options.onStartupProgress?.("Copying workspace");
+      options.onStartupProgress?.("Starting workspace");
+      const finish = () => { mock.destroyed = true; resolve({ exitCode: 0, cleanupFailed: mock.cleanupFailed, timedOut: false, ...(mock.cleanupFailed ? { error: "Workbench teardown unconfirmed" } : {}) }); };
+      options.signal.addEventListener("abort", finish, { once: true });
+      options.transport.onReady({ write(data) {
+        const frame = JSON.parse(data); mock.requests.push(frame);
+        if (frame.op === "close") { if (mock.sourceOnClose) emit({ type: "source-context", artifact: mock.sourceOnClose }); if (mock.lessonOnClose) emit({ type: "source-lesson", lesson: mock.lessonOnClose }); emit({ type: "result", id: frame.id }); }
+        else if (frame.type === "release") finish();
+        else if (frame.op === "autonomy") { const reply = () => emit(mock.autonomyError ? { type: "error", id: frame.id, error: mock.autonomyError } : { type: "result", id: frame.id }); if (mock.holdAutonomy) mock.releaseAutonomy = reply; else reply(); }
+        else if (frame.op === "webSearch") emit({ type: "result", id: frame.id });
+        else if (frame.op === "send" && mock.sendError) { emit({ type: "error", id: frame.id, error: mock.sendError }); }
+        else if (frame.op === "send" && mock.holdSend) { emit({ type: "event", name: "onAssistantDelta", args: ["Partial answer"] }); emit({ type: "event", name: "onUsage", args: [{inputTokens: 10, outputTokens: 3, turnTokensUsed: 13, turnTokenBudget: 100, iterations: 0, maxToolIterations: 100, kind: "planner"}] }); }
+        else if (frame.op === "send") { emit({ type: "event", name: "onAssistantDelta", args: ["hello"] }); emit({ type: "result", id: frame.id, value: { assistantText: "hello", stopReason: "end_turn" } }); }
+      }, end() { finish(); } });
+      emit({ type: "state", snapshot: { scanId: init.config.scanId, messages: [], tools: [], target: "/workspace", autonomyMode: init.config.autonomyMode ?? "standard" } });
+      if (!mock.holdReady) emit({ type: "ready", platform: "linux", workspace: "/workspace" });
+    });
+  },
+}));
+vi.mock("./workbench-plugins.js", () => ({ GUEST_PLUGIN_ASSETS: "/opt/0-approved-plugins", prepareWorkbenchPlugins: async () => ({ directory: mock.pluginDirectory, approvals: { schema: 1, project: "/workspace", enabled: {} }, cleanup: mock.pluginCleanup }) }));
+import { createWorkbenchConsoleSession } from "./workbench-console-session.js";
+
+const roots: string[] = [];
+afterEach(async () => { for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true }); mock.sourceOnClose = undefined; mock.lessonOnClose = undefined; mock.destroyed = false; mock.holdReady = false; mock.holdSend = false; mock.holdAutonomy = false; mock.autonomyError = undefined; mock.releaseAutonomy = undefined; mock.cleanupFailed = false; mock.sendError = undefined; mock.serviceConnections = []; mock.pluginDirectory = undefined; mock.pluginCleanup.mockClear(); mock.launches.length = 0; mock.requests.length = 0; });
+async function options() {
+  const root = realpathSync(await mkdtemp(join(tmpdir(), "0-controller-test-"))); roots.push(root);
+  return { config: { workspaceRoot: root, target: root }, workbench: { schemaVersion: 1 as const, image: "/approved.tar", imageDigest: "sha256:" + "a".repeat(64), stateRoot: join(root, "state"), workspaceRoot: root, providers: ["chatgpt-codex"], github: false, cpus: 1, memoryMb: 512, storageGb: 1 }, selection: { model: "granted" }, provider: { provider: "chatgpt-codex" as const, models: ["granted"], request: vi.fn() }, network: false };
+}
+describe("host console VM controller", () => {
+  it("preserves the explicit ask-first setting before startup and forwards later changes to the guest", async () => {
+    const input = await options();
+    const session = createWorkbenchConsoleSession({ ...input, config: { ...input.config, approvals: "ask" } });
+    try {
+      expect(session.approvals).toBe("ask");
+      session.setApprovals("auto");
+      expect(session.approvals).toBe("auto");
+      await session.send("Inspect");
+      const launch = mock.launches[0] as { transport: { initialInput: string } };
+      expect(JSON.parse(launch.transport.initialInput).config.approvals).toBe("auto");
+      await session.setApprovals("ask");
+      expect(session.approvals).toBe("ask");
+      await session.send("Continue under the new setting");
+      const change = mock.requests.findIndex(frame => frame.op === "autonomy");
+      expect(mock.requests[change]).toMatchObject({ op: "autonomy", approvals: "ask" });
+      expect(mock.requests.slice(change + 1).some(frame => frame.op === "send")).toBe(true);
+    } finally { await session.cleanup(); }
+  });
+  it("carries per-chat search into guest config and acknowledges idle changes without changing network grant", async () => {
+    const opts = await options();
+    const session = createWorkbenchConsoleSession({ ...opts, config: { ...opts.config, webSearchEnabled: false } });
+    try {
+      await session.send("Inspect source");
+      const launch = mock.launches[0] as { network: boolean; transport: { initialInput: string } };
+      expect(JSON.parse(launch.transport.initialInput).config.webSearchEnabled).toBe(false);
+      expect(launch.network).toBe(false);
+      await session.setWebSearchEnabled!(true);
+      expect(mock.requests.find(frame => frame.op === "webSearch")?.value).toBe(true);
+      expect(session.webSearchEnabled).toBe(true);
+      await session.send("Continue");
+      expect(mock.launches).toHaveLength(1);
+    } finally { await session.cleanup(); }
+  });
+  it("forwards bounded live memory provenance without restoring it from checkpoints", async () => {
+    const opts = await options();
+    const session = createWorkbenchConsoleSession(opts);
+    try {
+      await session.send("Inspect source");
+      expect(session.sourceContext).toBeUndefined();
+      const sourceContext = { status: "supplied", lessons: [{ title: "Routing", summary: "Inspect ownership checks", sourceLinks: [{ path: "routes.ts", hash: "sha256:" + "a".repeat(64) }] }] };
+      const emitState = (context: unknown) => mock.output!(JSON.stringify({ type: "state", snapshot: { scanId: session.scanId, messages: [], tools: [], target: "/workspace", autonomyMode: "standard", sourceContext: context } }) + "\n");
+      emitState(sourceContext);
+      expect(session.sourceContext).toEqual(sourceContext);
+      session.sourceContext!.lessons.splice(0);
+      expect(session.sourceContext).toEqual(sourceContext);
+      emitState({ status: "none", lessons: sourceContext.lessons });
+      expect(session.sourceContext).toBeUndefined();
+      emitState(sourceContext);
+      session.clearConversation();
+      expect(session.sourceContext).toBeUndefined();
+    } finally { await session.cleanup(); }
+  });
+
+  it("bridges skill editing and live editor context to host storage", async () => {
+    const opts = await options();
+    const skill = { id: "builtin/source-review", name: "source-review", revision: "a".repeat(64), writable: false };
+    const read = vi.fn(async () => skill);
+    const copy = vi.fn(async () => ({ ...skill, id: "workspace/copy", writable: true }));
+    const session = createWorkbenchConsoleSession({ ...opts, config: { ...opts.config, skillAuthoring: { read, create: async () => skill, update: async () => skill, copy }, skillEditor: { read: async () => skill } } });
+    try {
+      await session.send("Customize this skill");
+      const launch = mock.launches[0] as { transport: { initialInput: string } };
+      const init = JSON.parse(launch.transport.initialInput);
+      expect(init.callbacks).toEqual(expect.arrayContaining(["skillRead", "skillCreate", "skillSave", "skillCopy", "skillEditorRead"]));
+      expect(init.config.skillAuthoring).toBeUndefined();
+      expect(init.config.skillEditor).toBeUndefined();
+      const ask = async (id: string, name: string, args: unknown[]) => {
+        mock.output!(JSON.stringify({ type: "decision", id, name, args }) + "\n");
+        await vi.waitFor(() => expect(mock.requests.some(frame => frame.type === "decision-result" && frame.id === id)).toBe(true));
+        return mock.requests.find(frame => frame.type === "decision-result" && frame.id === id)!;
+      };
+      expect((await ask("context", "skillEditorRead", [])).value).toEqual(skill);
+      expect((await ask("read", "skillRead", [skill.id])).value).toEqual(skill);
+      const input = { content: "copy", expectedRevision: skill.revision };
+      await ask("copy", "skillCopy", [skill.id, input]);
+      expect(copy).toHaveBeenCalledWith(skill.id, input);
+    } finally { await session.cleanup(); }
+  });
+
+  it("bridges workflow editing and schedule lifecycle to host storage without serializing callbacks", async () => {
+    const opts = await options();
+    const workflow = { id: "workflow-bound", revision: 3, name: "Review", instructions: "", target: "", nodes: [], edges: [], createdAt: "2026-01-01", updatedAt: "2026-01-01" };
+    const save = vi.fn(async () => workflow);
+    const invoke = vi.fn(async () => ({ schedules: [] }));
+    const session = createWorkbenchConsoleSession({ ...opts, config: { ...opts.config, workflowAuthoring: { list: async () => [workflow], save, editor: { id: workflow.id, read: async () => workflow } }, workflowLifecycle: { invoke } } });
+    try {
+      await session.send("Change the workflow");
+      const launch = mock.launches[0] as { transport: { initialInput: string } };
+      const init = JSON.parse(launch.transport.initialInput);
+      expect(init.callbacks).toEqual(expect.arrayContaining(["workflowList", "workflowSave", "workflowEditorRead", "workflowInvoke"]));
+      expect(init.workflowEditorId).toBe(workflow.id);
+      expect(init.config.workflowAuthoring).toBeUndefined();
+      const ask = async (id: string, name: string, args: unknown[]) => {
+        mock.output!(JSON.stringify({ type: "decision", id, name, args }) + "\n");
+        await vi.waitFor(() => expect(mock.requests.some(frame => frame.type === "decision-result" && frame.id === id)).toBe(true));
+        return mock.requests.find(frame => frame.type === "decision-result" && frame.id === id)!;
+      };
+      expect((await ask("read", "workflowEditorRead", [])).value).toEqual(workflow);
+      expect((await ask("list", "workflowList", [])).value).toEqual([workflow]);
+      await ask("save", "workflowSave", [{ id: workflow.id, revision: 3 }]);
+      expect(save).toHaveBeenCalledWith({ id: workflow.id, revision: 3 });
+      await ask("schedule", "workflowInvoke", ["list_schedules", { workflowId: workflow.id }]);
+      expect(invoke).toHaveBeenCalledWith("list_schedules", { workflowId: workflow.id });
+    } finally { await session.cleanup(); }
+  });
+
+  it("publishes startup phases and clears their message when the guest is ready", async () => {
+    const opts = await options();
+    const updates: Array<{ status: string; message?: string }> = [];
+    const session = createWorkbenchConsoleSession({ ...opts, onExecution: value => updates.push(value) });
+    await session.send("hello");
+    expect(updates).toContainEqual(expect.objectContaining({ status: "pending", message: "Copying workspace" }));
+    expect(updates).toContainEqual(expect.objectContaining({ status: "pending", message: "Starting workspace" }));
+    expect(session.execution).toMatchObject({ status: "ready" });
+    expect(session.execution.message).toBeUndefined();
+    await session.cleanup();
+  });
+  it("starts lazily once, routes turns to guest, and uses snapshot isolation", async () => {
+    const input = await options(); const session = createWorkbenchConsoleSession(input); const delta = vi.fn();
+    await session.ready;  expect(mock.launches).toHaveLength(0);
+    expect((await session.send("message mentioning /private/host", { onAssistantDelta: delta })).assistantText).toBe("hello");
+    expect(delta).toHaveBeenCalledWith("hello");
+    const images = [{ mediaType: "image/png", data: "iVBORw0KGgo=", name: "paste.png" }];
+    await session.send("second", undefined, { images });
+    expect(mock.requests.filter(frame => frame.op === "send").at(-1)?.images).toEqual(images); expect(mock.launches).toHaveLength(1);
+    expect(mock.launches[0]).toMatchObject({ workspaceMode: "snapshot", environment: { ZERO_PROVIDER: "chatgpt-codex" }, tty: false, network: false });
+    expect(mock.requests.filter(frame => frame.op === "send").map(frame => frame.text)).toEqual(["message mentioning /private/host", "second"]);
+    await session.cleanup(); expect(session.execution.status).toBe("stopped");
+  });
+  it("forwards serialized provider bodies through the exact model grant", async () => {
+    const input = await options(); input.provider.request.mockResolvedValue(new Response("data: done\n\n", { headers: { "content-type": "text/event-stream" } }));
+    const session = createWorkbenchConsoleSession(input); await session.send("hello");
+    const body = JSON.stringify({ model: "granted", input: [] });
+    mock.output!(JSON.stringify({ type: "provider", id: "provider_request_1", envelope: { provider: "chatgpt-codex", model: "granted", body } }) + "\n");
+    await vi.waitFor(() => expect(input.provider.request).toHaveBeenCalledWith({ provider: "chatgpt-codex", model: "granted", body }, expect.any(AbortSignal)));
+    await vi.waitFor(() => expect(mock.requests.some(frame => frame.type === "provider-end")).toBe(true));
+    await session.cleanup();
+  });
+  it("never imports blank chats and imports real guest results only once", async () => {
+    const input = await options(); const onFindings = vi.fn();
+    const blank = createWorkbenchConsoleSession({ ...input, selection: { model: "granted", agentModels: { audit: "auto" }, autoRoute: true }, onFindings });
+    await blank.cleanup(); await blank.cleanup(); expect(onFindings).not.toHaveBeenCalled();
+    const active = createWorkbenchConsoleSession({ ...input, onFindings }); await active.send("hello");
+    await active.cleanup(); await active.cleanup(); expect(onFindings).toHaveBeenCalledTimes(1);
+  });
+  it("rejects host executable resources and ungranted providers before launch", async () => {
+    const input = await options(); expect(() => createWorkbenchConsoleSession({ ...input, config: { ...input.config, mcpHost: {} } as never })).toThrow("cannot execute");
+    expect(() => createWorkbenchConsoleSession({ ...input, selection: { model: "ungranted" } })).toThrow("grant");
+    const session = createWorkbenchConsoleSession(input); expect(() => session.reconfigureRuntime({ env: { SECRET: "host-secret" } })).toThrow("grant");
+    expect(mock.launches).toHaveLength(0); await session.cleanup();
+  });
+});
+
+it("cancels startup immediately and returns a cancelled outcome after teardown", async () => {
+ const input = await options(); mock.holdReady = true;
+ const session = createWorkbenchConsoleSession(input); const abort = new AbortController();
+ const turn = session.send("test", {}, { signal: abort.signal });
+ await vi.waitFor(() => expect(mock.launches).toHaveLength(1));
+ abort.abort();
+ await expect(turn).resolves.toMatchObject({ stopReason: "cancelled", assistantText: "", usage: { inputTokens: 0, outputTokens: 0 } });
+ expect(mock.requests.some(frame => frame.op === "send")).toBe(false);
+ await session.cleanup();
+});
+
+it("retains partial output and usage when a running guest needs cancellation escalation", async () => {
+ const input = await options(); mock.holdSend = true;
+ const session = createWorkbenchConsoleSession(input); const abort = new AbortController();
+ const turn = session.send("test", {}, { signal: abort.signal });
+ await vi.waitFor(() => expect(mock.requests.some(frame => frame.op === "send")).toBe(true));
+ abort.abort();
+ await expect(turn).resolves.toMatchObject({ stopReason: "cancelled", assistantText: "Partial answer", usage: {inputTokens: 10, outputTokens: 3}, budget: {tokensUsed: 13} });
+ await session.cleanup();
+});
+it("retains teardown failures instead of reporting a clean stop", async () => {
+ const input = await options(); mock.holdReady = true; mock.cleanupFailed = true;
+ const session = createWorkbenchConsoleSession(input); const abort = new AbortController();
+ const turn = session.send("test", {}, { signal: abort.signal });
+ await vi.waitFor(() => expect(mock.launches).toHaveLength(1)); abort.abort();
+ await expect(turn).rejects.toThrow("teardown unconfirmed");
+ await session.cleanup().catch(() => {});
+});
+
+it("persists final source references before releasing the guest for destruction", async () => {
+ const input = await options(); const content = "source content";
+ await writeFile(join(input.config.workspaceRoot, "code.ts"), content);
+ mock.sourceOnClose = { sourceLinks: [{ path: "code.ts", hash: "sha256:" + createHash("sha256").update(content).digest("hex") }] };
+ let release!: () => void;
+ const pending = new Promise<void>(resolve => { release = resolve; });
+ const persist = vi.fn(() => pending);
+ const session = createWorkbenchConsoleSession({ ...input, config: { ...input.config, codebaseLearning: true }, onSourceContext: persist }); await session.send("hello");
+ const cleanup = session.cleanup(); await vi.waitFor(() => expect(persist).toHaveBeenCalledOnce());
+ expect(mock.destroyed).toBe(false); expect(mock.requests.some(frame => frame.type === "release")).toBe(false);
+ expect(persist).toHaveBeenCalledWith(mock.sourceOnClose, { workspaceRoot: input.config.workspaceRoot, scanId: session.scanId, runId: expect.any(String) });
+ release(); await cleanup; expect(mock.destroyed).toBe(true);
+ await session.cleanup(); expect(persist).toHaveBeenCalledOnce();
+});
+it("surfaces durable-ingestion failure while still confirming teardown", async () => {
+ const input = await options(); await writeFile(join(input.config.workspaceRoot, "code.ts"), "source");
+ mock.sourceOnClose = { sourceLinks: [{ path: "code.ts", hash: "sha256:" + createHash("sha256").update("source").digest("hex") }] };
+ const session = createWorkbenchConsoleSession({ ...input, config: { ...input.config, codebaseLearning: true }, onSourceContext: async () => { throw new Error("private adapter failure"); } });
+ await session.send("hello"); await expect(session.cleanup()).rejects.toThrow("source context persistence failed");
+ expect(mock.destroyed).toBe(true);
+});
+
+it("persists semantic lessons before destruction and recalls only the workspace folder", async () => {
+ const input = await options(); await writeFile(join(input.config.workspaceRoot, "code.ts"), "source");
+ const lesson = { title: "Ownership", summary: "Review ownership checks in code.ts.", sourceLinks: [{ path: "code.ts", hash: "sha256:" + createHash("sha256").update("source").digest("hex") }] };
+ mock.lessonOnClose = lesson;
+ const persist = vi.fn(async (_lesson: unknown, _context: unknown) => { expect(mock.destroyed).toBe(false); });
+ const read = vi.fn(async () => [lesson]);
+ const session = createWorkbenchConsoleSession({ ...input, config: { ...input.config, codebaseLearning: true }, onSourceLesson: persist, readSourceLessons: read });
+ await session.send("Inspect");
+ mock.output!(JSON.stringify({ type: "decision", id: "source-query", name: "sourceLessons", args: ["/workspace"] }) + "\n");
+ await vi.waitFor(() => expect(mock.requests.find(frame => frame.id === "source-query")).toMatchObject({ value: [lesson] }));
+ mock.output!(JSON.stringify({ type: "decision", id: "foreign-query", name: "sourceLessons", args: ["/workspace/subtree"] }) + "\n");
+ await vi.waitFor(() => expect(mock.requests.find(frame => frame.id === "foreign-query")).toMatchObject({ value: [] }));
+ expect(read).toHaveBeenCalledTimes(1);
+ await session.cleanup();
+ expect(persist).toHaveBeenCalledOnce();
+ expect(persist.mock.calls[0]?.[1]).toMatchObject({ workspaceRoot: input.config.workspaceRoot, scopePath: input.config.workspaceRoot });
+ expect(mock.destroyed).toBe(true);
+});
+it.each([false, true])("confirms guest policy before publishing an active mode change (rejected=%s)", async rejected => {
+  const input = await options(); mock.holdSend = true; mock.holdAutonomy = true;
+  mock.autonomyError = rejected ? "Guest refused mode" : undefined;
+  const session = createWorkbenchConsoleSession({ ...input, config: { ...input.config, approvals: "ask" } }), abort = new AbortController();
+  const turn = session.send("Waiting in guest", {}, { signal: abort.signal });
+  try {
+    await vi.waitFor(() => expect(mock.requests.some(frame => frame.op === "send")).toBe(true));
+    const change = Promise.resolve(session.setApprovals("auto"));
+    const checked = rejected ? expect(change).rejects.toThrow("Guest refused mode") : change;
+    await vi.waitFor(() => expect(mock.releaseAutonomy).toBeTypeOf("function"));
+    const init = JSON.parse((mock.launches[0] as { transport: { initialInput: string } }).transport.initialInput);
+    mock.output!(JSON.stringify({ type: "state", snapshot: { scanId: init.config.scanId, messages: [], tools: [], target: "/workspace", approvals: "auto" } }) + "\n");
+    expect(session.approvals).toBe("ask");
+    mock.releaseAutonomy!(); await checked;
+    expect(session.approvals).toBe(rejected ? "ask" : "auto");
+    mock.output!(JSON.stringify({ type: "state", snapshot: { scanId: init.config.scanId, messages: [], tools: [], target: "/workspace", approvals: "ask" } }) + "\n");
+    expect(session.approvals).toBe(rejected ? "ask" : "auto");
+    expect(mock.launches).toHaveLength(1);
+  } finally {
+    abort.abort(); await turn; await session.cleanup();
+  }
+});

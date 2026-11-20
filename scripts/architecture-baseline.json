@@ -1,0 +1,5 @@
+{
+  "engineDirectoryCycles": [
+    "agent,events,plugins,recon,runtime,telemetry"
+  ]
+}

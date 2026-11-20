@@ -1,0 +1,57 @@
+node_modules/
+dist/
+dist-bin/
+*.tsbuildinfo
+**/.0/dev-engines/
+.DS_Store
+.cache/
+.claude/
+.omx/
+pnpm-publish-summary.json
+*.sync-conflict-*
+.worktrees/
+
+# Astro generated build artifacts (root + nested)
+.astro/
+**/.astro/
+
+
+# Private managed control-plane — not part of the public engine
+services/
+# Local build artifacts
+*.tgz
+!vendor/tree-sitter-0.21.1-node24.tgz
+.workbench/
+# Local secrets
+.env
+.env.*
+!.env.example
+
+# Local scanner configuration and generated baselines
+**/.foxguard/
+**/.foxguard.yml
+
+# Local scratch and engagement output; never commit
+/tmp/
+/ex.sh
+/test1_handshake*.py
+/.0/
+*.bak
+
+# Scratch files from local experiments that can contain credentials; never commit
+/.redeem_log*.json
+/.tok*
+/.wordlist.json
+/billing_before.json
+/redeem_*.json
+
+# Self-edit preview state (worktrees, scratch homes)
+.0-self-edit/
+__pycache__/
+*.pyc
+
+# Voyege
+shield/data/
+**/__pycache__/
+**/*.pyc
+.pytest_cache/

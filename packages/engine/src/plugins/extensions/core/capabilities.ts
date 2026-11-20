@@ -1,0 +1,76 @@
+/** What an extension can do, derived from its manifest. The approval is bound to this, not to a version string. */
+import { createHash } from "node:crypto";
+import { connectorCanDo, healthLine, type ConnectorDecl } from "./connector.js";
+import { isProviderKeyName } from "./env.js";
+import type { ExtensionManifest } from "./manifest.js";
+import { inspectLauncher } from "../mcp/core/launcher.js";
+
+export interface Capabilities {
+  skills: string[];
+  /** Bundled files bash can run. Nothing runs except through bash, under the usual approvals and sandbox. */
+  runs: string[];
+  mcp: Array<{ name: string; transport: string; command?: string; args: string[]; url?: string; env: string[]; headers: string[] }>;
+  /** The connector contract as declared: what it connects to, how, what it may read and write. */
+  service: Pick<ConnectorDecl, "service" | "title" | "auth" | "methods" | "hosts" | "read" | "write" | "env" | "health"> | null;
+  verify: string | null;
+  /** Environment variable names its scripts may receive once approved. */
+  env: string[];
+  bins: string[];
+  ignored: string[];
+}
+
+export const serviceOf = (c: ConnectorDecl): NonNullable<Capabilities["service"]> =>
+  ({ service: c.service, title: c.title, auth: c.auth, methods: c.methods, hosts: c.hosts, read: c.read, write: c.write, env: c.env, health: c.health });
+
+export function capabilitiesOf(m: ExtensionManifest): Capabilities {
+  return {
+    skills: m.skills.map(s => s.name).sort(),
+    runs: [...new Set([...m.scripts, ...(m.verify ? [m.verify] : [])])].sort(),
+    mcp: m.mcpServers.map(s => ({ name: s.name, transport: s.transport, ...(s.command ? { command: s.command } : {}), args: s.args, ...(s.url ? { url: s.url } : {}), env: s.env, headers: s.headers })).sort((a, b) => (a.name < b.name ? -1 : 1)),
+    service: m.connector ? serviceOf(m.connector) : null,
+    verify: m.verify,
+    env: [...new Set([...m.requires.env, ...(m.connector?.env ?? [])])].sort(), bins: [...m.requires.bins].sort(), ignored: [...m.ignored].sort(),
+  };
+}
+
+/** One stable line per capability: the unit of the approval diff. */
+export function capabilityLines(c: Capabilities): string[] {
+  const out: string[] = [];
+  for (const s of c.skills) out.push(`skill: ${s}`);
+  for (const f of c.runs) out.push(`runs commands: ${f}`);
+  // Everything that decides where the server connects and what it receives is in the line, so any change re-prompts:
+  // transport, command, EVERY arg, url, env NAMES and header NAMES (never values).
+  for (const s of c.mcp) out.push(`connects to MCP server: ${s.name} ${s.transport}${s.command ? ` command ${JSON.stringify(s.command)}` : ""}${s.args.length ? ` args ${JSON.stringify(s.args)}` : ""}${s.url ? ` url ${JSON.stringify(s.url)}` : ""}${s.env.length ? ` env ${s.env.join(",")}` : ""}${s.headers.length ? ` headers ${s.headers.join(",")}` : ""}`);
+  if (c.service) out.push(`calls a service: ${c.service.service} via ${c.service.methods.join("|")}${c.service.hosts.length ? ` hosts ${c.service.hosts.join(",")}` : ""} read ${c.service.read.join(",") || "-"} write ${c.service.write.join(",") || "-"} health ${healthLine(c.service.health)}`);
+  if (c.verify) out.push(`verifier: ${c.verify}`);
+  for (const n of c.env) out.push(`receives environment variable: ${n}`);
+  for (const b of c.bins) out.push(`needs program: ${b}`);
+  for (const i of c.ignored) out.push(`ignored (never run): ${i}`);
+  return out;
+}
+
+export const capabilityKey = (c: Capabilities): string => createHash("sha256").update(JSON.stringify(capabilityLines(c))).digest("hex");
+
+export function capabilityDelta(previous: Capabilities | null, next: Capabilities): { added: string[]; removed: string[] } {
+  const before = new Set(previous ? capabilityLines(previous) : []); const after = new Set(capabilityLines(next));
+  return { added: [...after].filter(l => !before.has(l)), removed: [...before].filter(l => !after.has(l)) };
+}
+
+/** Plain-language list for the install prompt. */
+export function canDoLines(c: Capabilities): string[] {
+  const out: string[] = [];
+  if (c.service) out.push(connectorCanDo(c.service));
+  if (c.runs.length) out.push(`runs commands through bash (${c.runs.length}): ${c.runs.slice(0, 8).join(", ")}${c.runs.length > 8 ? ", ..." : ""}`);
+  for (const s of c.mcp) out.push(`${s.url ? "connects to" : "starts an"} MCP server ${s.name}: ${s.url ?? [s.command, ...s.args].join(" ")}${s.env.length ? ` (env ${s.env.join(", ")})` : ""}${s.headers.length ? ` (headers ${s.headers.join(", ")})` : ""}`);
+  for (const s of c.mcp) {
+    const l = s.command ? inspectLauncher(s.command, s.args) : null;
+    if (l) out.push(`downloads ${l.spec ? JSON.stringify(l.spec.slice(0, 80)) : "a package"} from ${l.hosts[0]} each time MCP server ${s.name} starts via ${l.launcher}${l.pinned ? " (exact version pinned)" : ": NOT pinned to an exact version, so it will be refused at launch until the extension pins one"}`);
+  }
+  if (c.verify) out.push(`adds rules: verifier (${c.verify})`);
+  if (c.env.length) out.push(`receives environment variables: ${c.env.join(", ")} (model provider keys are never passed unless listed here)`);
+  if (c.ignored.length) out.push(`ignored, never run: ${c.ignored.join(", ")}`);
+  if (c.skills.length) out.push(`adds skills (text instructions): ${c.skills.join(", ")}`);
+  return out;
+}
+
+export const providerEnvNames = (c: Capabilities): string[] => c.env.filter(isProviderKeyName);

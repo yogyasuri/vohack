@@ -1,0 +1,205 @@
+import { queryKeys } from "@/queries";
+import { v } from "@/lib/vocabulary";
+import { useEffect } from "react";
+import { NavLink, useLocation, useNavigate } from "react-router-dom";
+import { useQuery } from "@tanstack/react-query";
+import { CapyComposeIcon as SquarePen, CapySearchIcon as Search } from "@/ui/icons/capy";
+import { PanelLeftIcon } from "@/ui/icons/panel";
+import { AccountMenu } from "@/components/team-access";
+import { backendRoute } from "@/lib/backend-client";
+import { Tooltip } from "@/components/ui/tooltip";
+import { openAppSearch } from "@/components/search-events";
+import { BrandMark } from "@/components/brand-mark";
+import { Button } from "@/components/ui/button";
+import {
+  SidebarFooter,
+  SidebarGroup,
+  SidebarHeader,
+  SidebarKbd,
+  SidebarLabel,
+  sidebarItemClasses,
+} from "@/ui/components/sidebar";
+import { matchShortcut, shortcutAria, shortcutHint } from "@/lib/shortcuts";
+import { useBackendApi } from "@/api";
+import { SIDEBAR_DESTINATIONS, WORKSPACE_DESTINATIONS, canonicalWorkspacePath, isSidebarDestinationActive } from "@/lib/workspace-navigation";
+import { backendRouteHref } from "./chat-host";
+import { matchesPreset } from "@/components/findings/findings-model";
+import { SidebarCards } from "./sidebar-cards";
+import { SentinelSidebarSection } from "@/components/sentinels/sentinel-sidebar-section";
+import { useSidebarListMode } from "@/components/sidebar/use-sidebar-list";
+import { cn } from "@/lib/utils";
+
+/** ⌘B (or ⇧⌘S) toggles the sidebar from anywhere except formatted editors, where ⌘B is bold. */
+export function useSidebarShortcut(toggle: () => void) {
+  useEffect(() => {
+    const handle = (event: KeyboardEvent) => {
+      if (!event.repeat && matchShortcut(event)?.handler === "sidebar.toggle") {
+        event.preventDefault();
+        toggle();
+      }
+    };
+    window.addEventListener("keydown", handle);
+    return () => window.removeEventListener("keydown", handle);
+  }, [toggle]);
+}
+
+/** ⇧⌘O opens a new chat and ⌘, opens settings from anywhere in the app. */
+export function useShellNavigationShortcuts(settingsHref: string) {
+  const navigate = useNavigate();
+  const newChatHref = useNewChatHref();
+  useEffect(() => {
+    const handle = (event: KeyboardEvent) => {
+      if (!(event.metaKey || event.ctrlKey) || event.altKey || event.repeat) return;
+      const key = event.key.toLowerCase();
+      if (event.shiftKey && key === "o") {
+        event.preventDefault();
+        navigate(newChatHref);
+      } else if (!event.shiftKey && event.key === ",") {
+        event.preventDefault();
+        navigate(settingsHref);
+      }
+    };
+    window.addEventListener("keydown", handle);
+    return () => window.removeEventListener("keydown", handle);
+  }, [navigate, newChatHref, settingsHref]);
+}
+
+function useNewChatHref() {
+  const { client } = useBackendApi();
+  const location = useLocation();
+  const requestedHost = new URLSearchParams(location.search).get("host");
+  const routeHost = backendRoute(location.pathname).backendId;
+  const activeHost =
+    requestedHost && /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/.test(requestedHost)
+      ? requestedHost
+      : routeHost !== "local"
+        ? routeHost
+        : client.backendId;
+  return backendRouteHref(activeHost, "/chats?new=1");
+}
+
+/** Capy-style sidebar content: brand and actions, chat history, destinations, account. */
+export function ConsoleNavigationRail({
+  settingsHref,
+  onHistorySlot,
+  onToggle,
+}: {
+  settingsHref: string;
+  onHistorySlot?: (element: HTMLDivElement | null) => void;
+  onToggle: () => void;
+}) {
+  const { getDashboard, client } = useBackendApi();
+  const location = useLocation();
+  const route = backendRoute(location.pathname);
+  const currentPath = canonicalWorkspacePath(location.pathname.slice(route.basename.length) || "/");
+  const newChatHref = useNewChatHref();
+  const newChatActive = currentPath === "/chats" && new URLSearchParams(location.search).get("new") === "1";
+  const dashboard = useQuery({
+    queryKey: queryKeys.dashboard(client.backendId),
+    queryFn: getDashboard,
+    staleTime: 30_000,
+    refetchOnWindowFocus: true,
+  });
+  const findingCount = dashboard.data?.groups.filter(group => matchesPreset(group, "review")).length ?? 0; // findings waiting on a person
+  // Seven items, no overflow menu: New thread, Findings, Skills, Memory, Computers, Extensions. A "run" is just a mission, so there is no Runs destination.
+  const destinations = SIDEBAR_DESTINATIONS.flatMap((to) => WORKSPACE_DESTINATIONS.filter((item) => item.to === to));
+  const active = (to: string) => isSidebarDestinationActive(to, currentPath);
+  const list = useSidebarListMode();
+
+  return (
+    <nav aria-label="Command Center navigation" className="flex h-full min-h-0 w-full flex-col pt-2">
+      <SidebarHeader>
+        <Tooltip content="Home" side="bottom">
+          <a
+            href={newChatHref}
+            aria-label={v("Voyege new {mission}")}
+            className="-ml-1 flex h-(--h-control-sm) shrink-0 items-center justify-center rounded-(--radius-button) px-1 outline-none transition-colors duration-100 hover:bg-secondary focus-visible:outline-ring-inset"
+          >
+            <BrandMark className="h-auto w-28" />
+          </a>
+        </Tooltip>
+        <div className="ml-auto flex items-center">
+          <Tooltip content="Search anything" shortcut="⌘K" side="bottom">
+            <Button
+              variant="ghost"
+              size="icon-sm"
+              aria-label="Search anything"
+              aria-keyshortcuts="Meta+K Control+K"
+              onClick={(event) => openAppSearch("all", event.currentTarget)}
+              className="text-muted-foreground-1"
+            >
+              <Search />
+            </Button>
+          </Tooltip>
+          <Tooltip content="Close sidebar" shortcut={shortcutHint("sidebar.toggle")} side="bottom">
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon-sm"
+              aria-keyshortcuts={shortcutAria("sidebar.toggle")}
+              aria-label="Close sidebar"
+              onClick={onToggle}
+              className="text-muted-foreground-1"
+            >
+              <PanelLeftIcon filled />
+            </Button>
+          </Tooltip>
+        </div>
+      </SidebarHeader>
+      <SidebarGroup aria-label="Primary destinations">
+        <a
+          href={newChatHref}
+          aria-keyshortcuts="Meta+Shift+O Control+Shift+O"
+          data-active={newChatActive || undefined}
+          className={sidebarItemClasses}
+        >
+          <SquarePen aria-hidden="true" />
+          <SidebarLabel>{v("New {mission}")}</SidebarLabel>
+          <SidebarKbd aria-hidden="true">⇧⌘O</SidebarKbd>
+        </a>
+        {destinations.map(({ to, label, icon: Icon }) => (
+          <NavLink key={to} to={to} data-active={active(to) || undefined} className={sidebarItemClasses}>
+            <Icon aria-hidden="true" />
+            <SidebarLabel>{label}</SidebarLabel>
+            {label === "Findings" && findingCount > 0 && (
+              <span
+                aria-label={`${findingCount} to review`}
+                className="ml-auto inline-flex h-3.5 min-w-4.5 shrink-0 items-center justify-center translate-y-px rounded-full border-[0.5px] border-[color-mix(in_oklch,var(--primary)_80%,black)] bg-primary px-1 text-[11px] leading-none font-bold tabular-nums text-primary-foreground shadow-[inset_0_1px_oklch(1_0_0/.12),var(--sh-plate)]"
+              >
+                {findingCount > 99 ? "99+" : findingCount}
+              </span>
+            )}
+          </NavLink>
+        ))}
+      </SidebarGroup>
+      {/* Both lists stay mounted: the Threads source keeps its queries and polling while Sentinels is shown. */}
+      {list.mode === "agents" && <SentinelSidebarSection />}
+      <div id="navigation-chat-history" className={cn("flex min-h-0 flex-1 flex-col", list.mode === "agents" && "hidden")}>
+        <div ref={onHistorySlot} className="flex h-full min-h-0 flex-col" />
+      </div>
+      <SidebarCards />
+      <SidebarFooter>
+        <AccountMenu settingsHref={settingsHref} />
+      </SidebarFooter>
+    </nav>
+  );
+}
+
+/** The one floating control left on the chrome while the sidebar is closed. Search and new chat stay on the palette and shortcuts. */
+export function ConsoleNavigationOpenButton({ onToggle }: { onToggle: () => void }) {
+  return (
+    <Tooltip content="Open sidebar" shortcut={shortcutHint("sidebar.toggle")} side="bottom">
+      <Button
+        type="button"
+        variant="ghost"
+        size="icon-sm"
+        aria-keyshortcuts={shortcutAria("sidebar.toggle")}
+        aria-label="Open sidebar"
+        onClick={onToggle}
+        className="text-muted-foreground-1"
+      >
+        <PanelLeftIcon filled={false} />
+      </Button>
+    </Tooltip>
+  );
+}

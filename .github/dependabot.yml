@@ -1,0 +1,32 @@
+# Dependency updates and security fixes. Third-party GitHub Actions are pinned
+# by commit SHA (with the tag in a comment); the github-actions ecosystem below
+# keeps those pins current. Replaces the retired Dependency Security workflow
+# (npm audit now runs as a non-blocking Main job; Python and Rust audits live in
+# 0verse.yml).
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      npm-minor-and-patch:
+        update-types: [minor, patch]
+    ignore:
+      # Grammar ABI must match the vendored tree-sitter 0.21.1 runtime.
+      - dependency-name: tree-sitter-c
+        update-types: [version-update:semver-minor, version-update:semver-major]
+  - package-ecosystem: github-actions
+    directories: [/, /.github/actions/setup-ci]
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      actions:
+        patterns: ["*"]
+  - package-ecosystem: docker
+    directory: /scripts/docker
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3

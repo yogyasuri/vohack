@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <script>
+      // Match web-theme.ts and web-appearance.ts before styles or the application bundle can paint.
+      (() => {
+        const root = document.documentElement;
+        const read = (key) => { try { return localStorage.getItem(key); } catch { return null; } };
+        const stored = read("zero-web-theme");
+        const pref = stored === "light" || stored === "dark" ? stored : "system";
+        const media = (query) => { try { return matchMedia(query).matches; } catch { return false; } };
+        // Colour themes (lib/color-themes.ts; a test keeps both lists in sync). Unknown ids fall back to the default.
+        const colorThemes = ["voyege", "dracula", "nord", "solarized", "catppuccin", "tokyo-night", "rose-pine", "one", "github", "gruvbox"];
+        const forcedModes = {};
+        const colorTheme = read("zero-web-color-theme");
+        const themed = colorThemes.includes(colorTheme) ? colorTheme : (colorTheme === "zero" ? null : "voyege"); // Voyege: glass theme by default
+        const theme = (themed && forcedModes[themed]) || (pref === "system" ? (media("(prefers-color-scheme: dark)") ? "dark" : "light") : pref);
+        if (themed) root.dataset.colorTheme = themed;
+        root.classList.toggle("dark", theme === "dark");
+        root.dataset.mode = theme;
+        root.style.colorScheme = theme;
+        // Neutral is the default accent. Pre-neutral users keep blue/green/violet/rose (legacy key); an old "orange" meant "never changed".
+        const legacyAccent = read("zero-web-accent");
+        const accent = read("zero-web-accent-v2") || (["blue", "green", "violet", "rose"].includes(legacyAccent) ? legacyAccent : null);
+        if (!themed && accent && accent !== "neutral" && ["orange", "blue", "green", "violet", "rose"].includes(accent)) root.dataset.accent = accent;
+        const size = read("zero-web-font-size");
+        if (size === "small" || size === "large") root.dataset.fontSize = size;
+        const motion = read("zero-web-motion");
+        if (motion === "reduce" || (motion !== "full" && media("(prefers-reduced-motion: reduce)"))) root.dataset.motion = "reduce";
+      })();
+    </script>
+    <script>
+      // Apply the persisted sidebar width/open state before first paint so the shell never flashes.
+      (() => {
+        try {
+          const m = /^\/b\/([A-Za-z0-9][A-Za-z0-9_.-]*)/.exec(location.pathname);
+          const read = (key) => {
+            const raw = localStorage.getItem("0-backend:" + JSON.stringify([m ? m[1] : "local", key])) ?? (m ? null : localStorage.getItem(key));
+            return raw === null ? undefined : JSON.parse(raw);
+          };
+          const width = read("0-sidebar-width");
+          const root = document.documentElement;
+          if (typeof width === "number" && isFinite(width)) root.style.setProperty("--sidebar-width-user", Math.min(330, Math.max(224, Math.round(width))) + "px");
+          if (read("0-sidebar-open") === false) root.dataset.sidebar = "closed";
+        } catch {}
+      })();
+    </script>
+    <link rel="preload" as="font" type="font/woff2" crossorigin href="./node_modules/@fontsource-variable/inter/files/inter-latin-wght-normal.woff2" />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="icon" href="/favicon.ico" sizes="32x32" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <title>Command Center · Voyege</title>
+    <script type="module" src="/src/main.tsx"></script>
+  </head>
+  <body>
+    <div id="root"></div>
+  </body>
+  </html>

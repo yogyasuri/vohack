@@ -1,0 +1,85 @@
+# Rule catalogue (PDF Part A §9, Part B §4D): the 11 live money and business rules.
+# Readable by finance. Each rule is checked read-only against records the platform already stores
+# (bookings, payments, refunds, coupons, wallet ledger, holds, supplier confirmations).
+rules:
+  - id: INV-M1
+    name: Amount charged equals the server's quoted price
+    flow: [quote, booking, payment]
+    brief: "a fare is changed in the request"
+    owner: Pricing
+    tier: L2
+    impact: 4
+  - id: INV-M10
+    name: Markup and commission change only by authorised roles, within policy range
+    flow: [quote, agency]
+    brief: "markup tampering"
+    owner: Pricing
+    tier: L2
+    impact: 4
+    range_percent: [0, 25]
+    allowed_roles: [admin]
+  - id: INV-M2
+    name: Refunds for a booking never exceed the eligible amount paid
+    flow: [refund]
+    brief: "a refund is paid twice"
+    owner: Refunds
+    tier: L3
+    impact: 4
+  - id: INV-M7
+    name: Only one refund per eligible cancellation, even under simultaneous requests
+    flow: [refund]
+    brief: "a refund is paid twice"
+    owner: Refunds
+    tier: L3
+    impact: 4
+  - id: INV-M3
+    name: Refund goes only to the original payment method or the agency wallet
+    flow: [refund]
+    brief: refund abuse
+    owner: Payments
+    tier: L3
+    impact: 4
+  - id: INV-M4
+    name: No confirmation or ticket without captured payment or reserved credit
+    flow: [booking, ticketing]
+    brief: "skipped payment steps"
+    owner: Booking
+    tier: L2
+    impact: 4
+  - id: INV-C1
+    name: Coupon redemptions never exceed the allowed count
+    flow: [coupon]
+    brief: "coupon or discount reuse"
+    owner: Promotions
+    tier: L2
+    impact: 3
+  - id: INV-M8
+    name: Quantities and amounts are never negative or zero-priced
+    flow: [quote, booking]
+    brief: "negative quantities"
+    owner: Pricing
+    tier: L2
+    impact: 3
+  - id: INV-M5
+    name: Agency spending never exceeds its credit limit, even under concurrency
+    flow: [wallet]
+    brief: credit abuse
+    owner: Wallet
+    tier: L3
+    impact: 4
+  - id: INV-S2
+    name: Holds are capped per agency and expire on time
+    flow: [hold]
+    brief: inventory abuse
+    owner: Inventory
+    tier: L2
+    impact: 2
+    max_holds_per_agency: 10
+    max_hold_minutes: 30
+  - id: INV-R1
+    name: Payment, booking and supplier records agree
+    flow: [booking, payment, supplier]
+    brief: reconciliation
+    owner: Integrations
+    tier: L0
+    impact: 3

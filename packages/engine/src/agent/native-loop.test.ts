@@ -1,0 +1,2279 @@
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { randomUUID } from "node:crypto";
+import {
+  runNativeAgentLoop,
+  compactMessagesWithLLM,
+  dropOldestMessages,
+  isContextWindowError,
+  isTransientLlmError,
+  computeBudgetWarningTurns,
+  toolFailureText,
+  BUDGET_WARNING_SOFT,
+  BUDGET_WARNING_HARD,
+  MAX_OUTPUT_CAP_CONTINUATIONS,
+  NATIVE_REQUEST_PREFLIGHT_BYTES,
+  estimateNativeRequestBytes,
+  compactMessagesForRequestPreflight,
+} from "./native-loop.js";
+import { ScanCostLedger } from "./cost-ledger.js";
+import { detectPlaybooks, buildPlaybookInjection, PLAYBOOKS } from "./playbooks.js";
+import type { NativeRuntime, NativeRuntimeResult, NativeMessage, NativeToolDef } from "../runtime/types.js";
+import type { Finding } from "../shared/index.js";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, realpathSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { eventBus, type SubagentMessagePayload } from "../events/bus.js";
+import { createFileNoteStore } from "../notes/index.js";
+import { buildSubagentMessage, getToolsForRole, ToolExecutor } from "./tools.js";
+
+const scopedTransport = vi.hoisted(() => vi.fn<typeof import("../http.js").fetchScoped>());
+vi.mock("../http.js", async (importOriginal) => ({
+  ...await importOriginal<typeof import("../http.js")>(),
+  fetchScoped: scopedTransport,
+}));
+
+// Memory is opt-in per run; keep the suite from reading or writing the real ~/.0 store.
+// The dedicated Memory describe below re-enables it and injects a throwaway store. This file-level hook runs outer-most, before any
+// describe-scoped beforeEach, so a nested `delete` of the same var wins.
+beforeEach(() => {
+  scopedTransport.mockReset();
+  scopedTransport.mockRejectedValue(new Error("Unexpected scoped HTTP fixture request"));
+  process.env["ZERO_DISABLE_HUNT_MEMORY"] = "1";
+  process.env["ZERO_DISABLE_MEMORY"] = "1";
+});
+afterEach(() => {
+  delete process.env["ZERO_DISABLE_HUNT_MEMORY"];
+  vi.unstubAllEnvs();
+});
+
+// ── Mock runtime that returns scripted responses ──
+
+function createMockRuntime(responses: NativeRuntimeResult[]): NativeRuntime {
+  let callIndex = 0;
+  return {
+    type: "api" as const,
+    async executeNative(
+      _system: string,
+      _messages: NativeMessage[],
+      _tools: NativeToolDef[],
+    ): Promise<NativeRuntimeResult> {
+      const response = responses[callIndex] ?? responses[responses.length - 1];
+      callIndex++;
+      return response;
+    },
+    async isAvailable() {
+      return true;
+    },
+  };
+}
+
+describe("native output-cap continuation", () => {
+  const checkpoint: NativeRuntimeResult = {
+    content: [{ type: "text", text: "Verified observation; plan still in progress." }],
+    stopReason: "max_tokens", checkpoint: { reason: "max_output_tokens", discardedToolCalls: 1 },
+    usage: { inputTokens: 10, outputTokens: 8192, cachedInputTokens: 4 }, durationMs: 1,
+  };
+  const config = {
+    role: "discovery" as const, systemPrompt: "Retain observations and finish the report.", tools: [],
+    maxTurns: 10, target: "https://example.test", scanId: "cap-continuation",
+  };
+
+  it("pauses repeated caps without reporting a provider/worker failure", async () => {
+    const executeNative = vi.fn(async () => structuredClone(checkpoint));
+    const state = await runNativeAgentLoop({ config, runtime: { type: "api", executeNative, isAvailable: async () => true }, db: null });
+    expect(executeNative).toHaveBeenCalledTimes(MAX_OUTPUT_CAP_CONTINUATIONS + 1);
+    expect(state.done).toBe(false);
+    expect(state.errorExit).toBeUndefined();
+    expect(state.outputCapExit?.continuations).toBe(MAX_OUTPUT_CAP_CONTINUATIONS);
+    expect(state.summary).toMatch(/resume/i);
+    expect(state.messages.filter(message => message.role === "assistant").map(message => message.content))
+      .toEqual(Array.from({ length: MAX_OUTPUT_CAP_CONTINUATIONS + 1 }, () => checkpoint.content));
+  });
+
+  it("charges a capped response to the shared cost ceiling before any continuation", async () => {
+    const ledger = new ScanCostLedger();
+    const executeNative = vi.fn(async () => structuredClone(checkpoint));
+    const state = await runNativeAgentLoop({ config: { ...config, costCeilingUsd: 0.001, costModel: "gpt-4o", costLedger: ledger },
+      runtime: { type: "api", executeNative, isAvailable: async () => true }, db: null });
+    expect(executeNative).toHaveBeenCalledOnce();
+    expect(state.costCeilingExceeded).toBe(true);
+    expect(state.errorExit).toBeUndefined();
+    expect(state.totalUsage.outputTokens).toBe(8192);
+    expect(ledger.totalCostUsd()).toBeGreaterThan(0.001);
+    expect(state.messages.at(-1)?.content).toEqual(checkpoint.content);
+  });
+
+  it("does not spend another monetary-budgeted request when capped usage is unavailable", async () => {
+    const executeNative = vi.fn(async () => ({ ...checkpoint, usage: undefined }));
+    const state = await runNativeAgentLoop({ config: { ...config, costCeilingUsd: 1 },
+      runtime: { type: "api", executeNative, isAvailable: async () => true }, db: null });
+    expect(executeNative).toHaveBeenCalledOnce();
+    expect(state.done).toBe(false);
+    expect(state.errorExit).toBeUndefined();
+    expect(state.outputCapExit?.message).toMatch(/without token usage/);
+    expect(state.messages.at(-1)?.content).toEqual(checkpoint.content);
+  });
+
+  it("honors cancellation after a cap without another request or incomplete dispatch", async () => {
+    const controller = new AbortController();
+    const executeNative = vi.fn(async () => structuredClone(checkpoint));
+    const state = await runNativeAgentLoop({ config, runtime: { type: "api", executeNative, isAvailable: async () => true },
+      db: null, signal: controller.signal, onTurn: () => controller.abort() });
+    expect(executeNative).toHaveBeenCalledOnce();
+    expect(state.done).toBe(false);
+    expect(state.summary).toMatch(/cancelled/i);
+    expect(state.messages.at(-1)?.content).toEqual(checkpoint.content);
+    expect(state.totalUsage.outputTokens).toBe(8192);
+  });
+
+  it("does not extend the loop turn allowance to continue an output cap", async () => {
+    const executeNative = vi.fn(async () => structuredClone(checkpoint));
+    const state = await runNativeAgentLoop({ config: { ...config, maxTurns: 1 },
+      runtime: { type: "api", executeNative, isAvailable: async () => true }, db: null });
+    expect(executeNative).toHaveBeenCalledOnce();
+    expect(state.turnCount).toBe(1);
+    expect(state.outputCapExit?.continuations).toBe(0);
+    expect(state.errorExit).toBeUndefined();
+    expect(state.done).toBe(false);
+  });
+
+  it("refuses a checkpoint that includes an incomplete tool invocation", async () => {
+    const executeNative = vi.fn(async () => ({
+      ...checkpoint, content: [{ type: "tool_use" as const, id: "unsafe", name: "done", input: { summary: "must not finish" } }],
+    }));
+    const state = await runNativeAgentLoop({ config, runtime: { type: "api", executeNative, isAvailable: async () => true }, db: null });
+    expect(executeNative).toHaveBeenCalledOnce();
+    expect(state.done).toBe(false);
+    expect(state.errorExit?.error).toMatch(/Invalid output-cap checkpoint/);
+    expect(state.messages.flatMap(message => message.content).some(block => block.type === "tool_use")).toBe(false);
+  });
+});
+
+// ── Tests ──
+
+describe("runNativeAgentLoop", () => {
+
+  it("delivers a text-only final answer to the worker transcript observer", async () => {
+    const finalAnswer = "Source review complete. No verified parser defect.";
+    const observed: string[] = [];
+    const state = await runNativeAgentLoop({
+      config: { role: "discovery", systemPrompt: "test", tools: [], maxTurns: 1, target: "https://example.com", scanId: randomUUID() },
+      runtime: createMockRuntime([{ content: [{ type: "text", text: finalAnswer }], stopReason: "end_turn", durationMs: 1 }]),
+      db: null,
+      onTurn: (turn, calls, results, assistant) => {
+        const message = buildSubagentMessage({ agent_id: "worker", name: "Worker", parent_scan_id: "parent", task: "review", max_turns: 1 }, turn, assistant, calls, results, Date.now());
+        if (message.assistant) observed.push(message.assistant);
+      },
+    });
+    expect(state.summary).toBe(finalAnswer);
+    expect(observed).toEqual([finalAnswer]);
+  });
+
+  it("regression: preserves error summary instead of clobbering with 'reached max turns'", async () => {
+    // Every multi-turn scan that hit a transient Azure/OpenAI API error on
+    // turn N < maxTurns used to end up with an internally inconsistent
+    // stage summary like "Retry (5 turns): Agent reached max turns (10)".
+    // Root cause: the error-bail break at native-loop.ts:~263 set
+    // state.summary = "Error: ..." but did NOT flip done /
+    // earlyStopNoProgress / costCeilingExceeded, and the post-loop code
+    // at line 517 then silently overwrote the real error with the generic
+    // max-turns message. This test forces that path and asserts the error
+    // summary survives.
+    const runtime: NativeRuntime = {
+      type: "api" as const,
+      async executeNative() {
+        return {
+          content: [],
+          stopReason: "error",
+          error: "Azure OpenAI API error 400: invalid request",
+          durationMs: 30_000,
+        };
+      },
+      async isAvailable() { return true; },
+    };
+
+    const state = await runNativeAgentLoop({
+      config: {
+        role: "attack",
+        systemPrompt: "test",
+        tools: [],
+        maxTurns: 10,
+        target: "https://example.com",
+        scanId: "test-scan",
+      },
+      runtime,
+      db: null,
+    });
+
+    expect(state.done).toBe(false);
+    expect(state.summary).toMatch(/^Error:/);
+    expect(state.summary).toContain("Azure OpenAI API error 400: invalid request");
+    expect(state.summary).not.toContain("reached max turns");
+    expect(state.turnCount).toBeLessThan(10);
+  });
+
+  it("enforces max turns limit", async () => {
+    // Runtime always returns a tool call (never done), forcing max turns
+    let turnNum = 0;
+    const runtime: NativeRuntime = {
+      type: "api" as const,
+      async executeNative() {
+        turnNum++;
+        return {
+          content: [{ type: "tool_use", id: `tc${turnNum}`, name: "update_target", input: { type: "api" } }],
+          stopReason: "tool_use",
+          durationMs: 50,
+        };
+      },
+      async isAvailable() { return true; },
+    };
+
+    const state = await runNativeAgentLoop({
+      config: {
+        role: "attack",
+        systemPrompt: "test",
+        tools: [],
+        maxTurns: 3,
+        target: "https://example.com",
+        scanId: "test-scan",
+      },
+      runtime,
+      db: null,
+    });
+
+    expect(state.done).toBe(false);
+    expect(state.turnCount).toBe(3);
+    expect(state.summary).toContain("max turns");
+  });
+
+  it("does not accept a silent end_turn as a conclusion", async () => {
+    // On the Responses path a reasoning-only turn used to arrive with the
+    // model's flattened thinking in `content`, so an early exit here reported
+    // the paraphrase as the scan summary. The paraphrase is gone now, which
+    // leaves genuinely empty content — that must not exit as `done` with an
+    // empty summary. Non-zero `outputTokens` is what distinguishes this from
+    // the empty-response transient above: the model spent tokens thinking and
+    // then said nothing.
+    let callCount = 0;
+    const runtime: NativeRuntime = {
+      type: "api" as const,
+      async executeNative() {
+        callCount++;
+        if (callCount >= 6) {
+          return {
+            content: [{ type: "text", text: "Real conclusion" }],
+            stopReason: "end_turn",
+            usage: { inputTokens: 10, outputTokens: 5 },
+            durationMs: 50,
+          };
+        }
+        return {
+          content: [],
+          stopReason: "end_turn",
+          usage: { inputTokens: 10, outputTokens: 40 },
+          durationMs: 50,
+        };
+      },
+      async isAvailable() { return true; },
+    };
+
+    const state = await runNativeAgentLoop({
+      config: {
+        role: "discovery",
+        systemPrompt: "test",
+        tools: [],
+        maxTurns: 10,
+        target: "https://example.com",
+        scanId: "test-scan",
+      },
+      runtime,
+      db: null,
+    });
+
+    expect(state.summary).toBe("Real conclusion");
+    expect(state.turnCount).toBeGreaterThanOrEqual(6);
+  });
+
+  it("executes tool calls and collects results", async () => {
+    let turnNum = 0;
+    const runtime: NativeRuntime = {
+      type: "api" as const,
+      async executeNative() {
+        turnNum++;
+        if (turnNum === 1) {
+          return {
+            content: [
+              { type: "tool_use", id: "tc1", name: "update_todos", input: { todos: [{ content: "Probe target" }] } },
+            ],
+            stopReason: "tool_use",
+            durationMs: 100,
+          };
+        }
+        return {
+          content: [{ type: "text", text: "Planned" }],
+          stopReason: "end_turn",
+          durationMs: 50,
+        };
+      },
+      async isAvailable() { return true; },
+    };
+
+    const state = await runNativeAgentLoop({
+      config: {
+        role: "discovery",
+        systemPrompt: "test",
+        tools: [],
+        maxTurns: 5,
+        target: "https://example.com",
+        scanId: "test-scan",
+      },
+      runtime,
+      db: null,
+    });
+
+    expect(state.done).toBe(true);
+    expect(state.turnCount).toBe(2);
+  });
+
+  it("saves findings via finding tool", async () => {
+    let turnNum = 0;
+    const savedFindings: Finding[] = [];
+    const runtime: NativeRuntime = {
+      type: "api" as const,
+      async executeNative() {
+        turnNum++;
+        if (turnNum === 1) {
+          return {
+            content: [{
+              type: "tool_use",
+              id: "tc1",
+              name: "finding",
+              input: {
+                title: "Test XSS",
+                severity: "high",
+                category: "xss",
+                evidence_request: "GET /test",
+                evidence_response: "<script>alert(1)</script>",
+              },
+            }],
+            stopReason: "tool_use",
+            durationMs: 100,
+          };
+        }
+        return {
+          content: [{ type: "text", text: "Found XSS" }],
+          stopReason: "end_turn",
+          durationMs: 50,
+        };
+      },
+      async isAvailable() { return true; },
+    };
+
+    const state = await runNativeAgentLoop({
+      config: {
+        role: "attack",
+        systemPrompt: "test",
+        tools: [],
+        maxTurns: 5,
+        target: "https://example.com",
+        scanId: "test-scan",
+      },
+      runtime,
+      db: null,
+      onFindingSaved: (finding) => {
+        savedFindings.push(finding);
+      },
+    });
+
+    expect(state.findings).toHaveLength(1);
+    expect(state.findings[0].title).toBe("Test XSS");
+    expect(state.findings[0].severity).toBe("high");
+    expect(savedFindings).toHaveLength(1);
+    expect(savedFindings[0]).toBe(state.findings[0]);
+  });
+
+  it("handles API errors gracefully", async () => {
+    const runtime = createMockRuntime([
+      {
+        content: [],
+        stopReason: "error",
+        durationMs: 100,
+        error: "Invalid API key",
+      },
+    ]);
+
+    const state = await runNativeAgentLoop({
+      config: {
+        role: "discovery",
+        systemPrompt: "test",
+        tools: [],
+        maxTurns: 5,
+        target: "https://example.com",
+        scanId: "test-scan",
+      },
+      runtime,
+      db: null,
+    });
+
+    // Error breaks the loop; agent is not "done" (didn't call done tool)
+    expect(state.done).toBe(false);
+    expect(state.turnCount).toBe(1);
+    // No findings since the loop errored before any tool execution
+    expect(state.findings).toHaveLength(0);
+  });
+
+
+  it("triggers early stop for attack role at 50% budget when no finding called", async () => {
+    vi.stubEnv("ZERO_FEATURE_EARLY_STOP", "1");
+    let turnNum = 0;
+    const runtime: NativeRuntime = {
+      type: "api" as const,
+      async executeNative() {
+        turnNum++;
+        return {
+          content: [{ type: "tool_use", id: `tc${turnNum}`, name: "http_request", input: { url: "https://example.com" } }],
+          stopReason: "tool_use",
+          durationMs: 50,
+        };
+      },
+      async isAvailable() { return true; },
+    };
+
+    const state = await runNativeAgentLoop({
+      config: {
+        role: "attack",
+        systemPrompt: "test",
+        tools: [],
+        maxTurns: 20,
+        target: "https://example.com",
+        scanId: "test-scan",
+        retryCount: 0,
+      },
+      runtime,
+      db: null,
+    });
+
+    // Should stop at turn 10 (50% of 20)
+    expect(state.earlyStopNoProgress).toBe(true);
+    expect(state.turnCount).toBe(10);
+    expect(state.summary).toContain("Early stop");
+    expect(state.attemptSummary).toContain("http_request");
+    // progressSummary may be empty if the LLM summary call fails (mock returns tool_use, not text)
+    expect(typeof state.progressSummary).toBe("string");
+  });
+
+  it("generates LLM progress summary on early stop when progressHandoff is enabled", async () => {
+    vi.stubEnv("ZERO_FEATURE_EARLY_STOP", "1");
+    let turnNum = 0;
+    let callCount = 0;
+    const runtime: NativeRuntime = {
+      type: "api" as const,
+      async executeNative() {
+        callCount++;
+        turnNum++;
+        // After the main loop ends (early stop at turn 10), the progress
+        // summary generation will call executeNative once more. Detect that
+        // by checking if we're past the halfway mark.
+        if (turnNum > 10) {
+          return {
+            content: [{ type: "text", text: "### Endpoints/URLs Discovered\n- https://example.com/api\n- https://example.com/login\n\n### Vulnerabilities Tested & Results\n- SQLi on /login: blocked by WAF\n- XSS on /search: reflected but sanitized\n\n### Credentials/Tokens/Cookies Found\nNone found.\n\n### Failed Approaches & Why\n- SQL injection blocked by parameterized queries\n\n### Remaining Untried Approaches\n- SSTI via template engine\n- SSRF via URL parameters" }],
+            stopReason: "end_turn",
+            durationMs: 100,
+          };
+        }
+        return {
+          content: [{ type: "tool_use", id: `tc${turnNum}`, name: "http_request", input: { url: "https://example.com" } }],
+          stopReason: "tool_use",
+          durationMs: 50,
+        };
+      },
+      async isAvailable() { return true; },
+    };
+
+    const scanId = `test-progress-summary-${randomUUID()}`;
+    const state = await runNativeAgentLoop({
+      config: {
+        role: "attack",
+        systemPrompt: "test",
+        tools: [],
+        maxTurns: 20,
+        target: "https://example.com",
+        scanId,
+        retryCount: 0,
+      },
+      runtime,
+      db: null,
+    });
+
+    try {
+      expect(state.earlyStopNoProgress).toBe(true);
+      expect(state.progressSummary).toContain("Endpoints/URLs Discovered");
+      expect(state.progressSummary).toContain("example.com");
+      expect(state.progressSummary).toContain("Remaining Untried Approaches");
+      expect(state.progressPath).toContain("progress.json");
+    } finally {
+      if (state.progressPath) rmSync(dirname(state.progressPath), { recursive: true, force: true });
+    }
+
+  });
+});
+
+// ── Playbook detection tests ──
+
+describe("detectPlaybooks", () => {
+  it("detects SQLi from SQL error messages", () => {
+    const texts = [
+      'Error: You have an error in your SQL syntax near \'"\' at line 1',
+      "SELECT * FROM users WHERE id = 1",
+    ];
+    const types = detectPlaybooks(texts);
+    expect(types).toContain("sqli");
+  });
+
+  it("detects SSTI from template syntax", () => {
+    const texts = [
+      "Response: Hello {{user.name}}, welcome!",
+      "Using Jinja2 template engine",
+    ];
+    const types = detectPlaybooks(texts);
+    expect(types).toContain("ssti");
+  });
+
+  it("detects IDOR from URL patterns with IDs", () => {
+    const texts = [
+      "Found endpoint: /api/users/1",
+      "GET /profile?id=42 returned user data with user_id field",
+    ];
+    const types = detectPlaybooks(texts);
+    expect(types).toContain("idor");
+  });
+
+  it("requires at least 2 pattern matches to trigger", () => {
+    // Only one pattern match — should not trigger
+    const texts = ["some random text with the word password in it"];
+    const types = detectPlaybooks(texts);
+    // auth_bypass requires 2+ matches; "password" alone is just 1
+    expect(types).not.toContain("sqli");
+    expect(types).not.toContain("ssti");
+  });
+
+  it("returns at most 3 playbook types", () => {
+    const texts = [
+      "SQL syntax error in SELECT query from information_schema",
+      "{{7*7}} returned 49 in Jinja2 template",
+      "/api/users/1 with user_id and owner_id",
+      "<script>alert(1)</script> reflected with onerror handler and innerHTML",
+      "webhook callback url with proxy and redirect",
+      "file path include traversal ../../etc/passwd /proc/self",
+      "login auth password session jwt bearer unauthorized 401 403",
+      "exec system popen subprocess child_process shell ping",
+    ];
+    const types = detectPlaybooks(texts);
+    expect(types.length).toBeLessThanOrEqual(3);
+  });
+
+  it("returns empty array when no patterns match", () => {
+    const texts = ["Everything looks normal here", "No vulnerabilities found"];
+    const types = detectPlaybooks(texts);
+    expect(types).toHaveLength(0);
+  });
+});
+
+describe("buildPlaybookInjection", () => {
+  it("returns empty string for empty types", () => {
+    expect(buildPlaybookInjection([])).toBe("");
+  });
+
+  it("includes playbook content for detected types", () => {
+    const result = buildPlaybookInjection(["sqli", "idor"]);
+    expect(result).toContain("SQLi Playbook");
+    expect(result).toContain("IDOR Playbook");
+    expect(result).toContain("Dynamic Playbook Injection");
+  });
+
+  it("skips unknown types gracefully", () => {
+    const result = buildPlaybookInjection(["sqli", "unknown_type"]);
+    expect(result).toContain("SQLi Playbook");
+    expect(result).not.toContain("unknown_type");
+  });
+});
+
+describe("PLAYBOOKS registry", () => {
+  it("contains all expected vulnerability types", () => {
+    const expectedTypes = ["sqli", "ssti", "idor", "xss", "ssrf", "lfi", "auth_bypass", "command_injection"];
+    for (const t of expectedTypes) {
+      expect(PLAYBOOKS[t]).toBeDefined();
+      expect(PLAYBOOKS[t].length).toBeGreaterThan(50);
+    }
+  });
+});
+
+describe("runNativeAgentLoop cost ceiling", () => {
+  // Build a runtime that always returns a benign tool call (so it would
+  // otherwise loop until maxTurns) and reports usage on each turn so the
+  // running cost grows.
+  function createCostBurningRuntime(perTurnInput: number, perTurnOutput: number): NativeRuntime {
+    let turn = 0;
+    return {
+      type: "api" as const,
+      async executeNative() {
+        turn++;
+        return {
+          content: [
+            { type: "tool_use", id: `tc${turn}`, name: "update_target", input: { type: "api" } },
+          ],
+          stopReason: "tool_use",
+          durationMs: 10,
+          usage: { inputTokens: perTurnInput, outputTokens: perTurnOutput },
+        };
+      },
+      async isAvailable() {
+        return true;
+      },
+    };
+  }
+
+  it("aborts the loop when running cost exceeds the ceiling", async () => {
+    // Default pricing is $3/M input + $15/M output.
+    // 200k input + 50k output per turn ≈ $0.0006 + $0.00075 = $0.00135/turn.
+    // Ceiling $0.001 → exceeded after the first turn.
+    const runtime = createCostBurningRuntime(200_000, 50_000);
+    const state = await runNativeAgentLoop({
+      config: {
+        role: "attack",
+        systemPrompt: "test",
+        tools: [],
+        maxTurns: 50,
+        target: "https://example.com",
+        scanId: "ceiling-test",
+        costCeilingUsd: 0.001,
+      },
+      runtime,
+      db: null,
+    });
+
+    expect(state.costCeilingExceeded).toBe(true);
+    expect(state.done).toBe(false);
+    expect(state.turnCount).toBeLessThanOrEqual(2);
+    expect(state.summary).toContain("Cost ceiling exceeded");
+    expect(state.estimatedCostUsd).toBeGreaterThanOrEqual(0.001);
+  });
+
+  it("does NOT abort when ceiling is not configured (default behavior preserved)", async () => {
+    const runtime = createCostBurningRuntime(200_000, 50_000);
+    const state = await runNativeAgentLoop({
+      config: {
+        role: "attack",
+        systemPrompt: "test",
+        tools: [],
+        maxTurns: 3,
+        target: "https://example.com",
+        scanId: "no-ceiling-test",
+      },
+      runtime,
+      db: null,
+    });
+
+    expect(state.costCeilingExceeded).toBe(false);
+    expect(state.turnCount).toBe(3);
+  });
+
+  it("keeps the configured model rate in the final estimated cost", async () => {
+    const state = await runNativeAgentLoop({
+      config: {
+        role: "attack",
+        systemPrompt: "test",
+        tools: [],
+        maxTurns: 1,
+        target: "https://example.com",
+        scanId: "model-specific-final-cost",
+        costModel: "DeepSeek-V4-Pro",
+      },
+      runtime: createCostBurningRuntime(1_000_000, 1_000_000),
+      db: null,
+    });
+
+    expect(state.estimatedCostUsd).toBeCloseTo(1.74 + 3.48, 5);
+  });
+
+  it("prices Auto usage after lazy service resolution instead of charging the routing label", async () => {
+    const ledger = new ScanCostLedger();
+    const streamedCosts: unknown[] = [];
+    let model = "";
+    const runtime: NativeRuntime = {
+      type: "api",
+      resolvedModel: () => model,
+      isAvailable: async () => true,
+      async executeNative(_system, _messages, _tools, callbacks) {
+        model = "DeepSeek-V4-Pro";
+        const usage = { inputTokens: 1_000_000, outputTokens: 1_000_000 };
+        callbacks?.onUsage?.(usage);
+        return { content: [{ type: "text", text: "Done" }], stopReason: "end_turn", durationMs: 0, usage };
+      },
+    };
+    const state = await runNativeAgentLoop({
+      config: {
+        role: "attack", systemPrompt: "test", tools: [], maxTurns: 1,
+        target: "https://example.com", scanId: randomUUID(),
+        costModel: "auto", costLedger: ledger, costCeilingUsd: 6,
+      },
+      runtime, db: null,
+      onEvent: (kind, payload) => {
+        if (kind === "usage") streamedCosts.push(payload.estimatedCostUsd);
+      },
+    });
+    expect(state.estimatedCostUsd).toBeCloseTo(5.22, 5);
+    expect(streamedCosts).toEqual([5.22]);
+    expect(ledger.totalCostUsd()).toBeCloseTo(5.22, 5);
+    expect(ledger.soleModel()).toBe("DeepSeek-V4-Pro");
+    expect(state.costCeilingExceeded).toBe(false);
+  });
+
+  it("does NOT abort when running cost is well below the ceiling", async () => {
+    // Tiny per-turn cost; $100 ceiling → never hit.
+    const runtime = createCostBurningRuntime(100, 100);
+    const state = await runNativeAgentLoop({
+      config: {
+        role: "attack",
+        systemPrompt: "test",
+        tools: [],
+        maxTurns: 3,
+        target: "https://example.com",
+        scanId: "high-ceiling-test",
+        costCeilingUsd: 100,
+      },
+      runtime,
+      db: null,
+    });
+
+    expect(state.costCeilingExceeded).toBe(false);
+    expect(state.turnCount).toBe(3);
+    expect(state.estimatedCostUsd).toBeLessThan(0.01);
+  });
+
+  it("emits a cost_ceiling_exceeded event when triggered", async () => {
+    const events: Array<{ type: string; payload: Record<string, unknown> }> = [];
+    const runtime = createCostBurningRuntime(200_000, 50_000);
+    await runNativeAgentLoop({
+      config: {
+        role: "attack",
+        systemPrompt: "test",
+        tools: [],
+        maxTurns: 50,
+        target: "https://example.com",
+        scanId: "event-test",
+        costCeilingUsd: 0.001,
+      },
+      runtime,
+      db: null,
+      onEvent: (type, payload) => events.push({ type, payload }),
+    });
+
+    const ceilingEvent = events.find((e) => e.type === "cost_ceiling_exceeded");
+    expect(ceilingEvent).toBeDefined();
+    expect(ceilingEvent!.payload.ceilingUsd).toBe(0.001);
+    expect(ceilingEvent!.payload.runningCostUsd).toBeGreaterThanOrEqual(0.001);
+  });
+
+  it("shared ledger: a second session trips on the FIRST session's spend (scan-wide ceiling)", async () => {
+    // Regression for the 0review $3-ceiling escape: research + verify are
+    // SEPARATE agent sessions, each tracking its own totalUsage from zero, so
+    // a per-session check granted every session the full ceiling and a
+    // $3-capped review could really spend research($3) + N×verify($3). With
+    // one ScanCostLedger threaded through both, the second session prices the
+    // cross-session cumulative total and trips on the first session's spend.
+    //
+    // 200k input + 50k output per turn at default pricing ($3/$15 per 1M)
+    // costs $0.60 + $0.75 = $1.35/turn. Ceiling $2.00: one turn alone stays
+    // under ($1.35 < $2.00); two sessions × one turn cross it ($2.70 ≥ $2.00).
+    const ledger = new ScanCostLedger();
+
+    // Session A (e.g. "research"): burns one turn — $1.35 < $2.00 — and
+    // must NOT trip.
+    const sessionA = await runNativeAgentLoop({
+      config: {
+        role: "attack",
+        systemPrompt: "test",
+        tools: [],
+        maxTurns: 1,
+        target: "https://example.com",
+        scanId: "ledger-session-a",
+        costCeilingUsd: 2.0,
+        costLedger: ledger,
+      },
+      runtime: createCostBurningRuntime(200_000, 50_000),
+      db: null,
+    });
+    expect(sessionA.costCeilingExceeded).toBe(false);
+    expect(sessionA.turnCount).toBe(1);
+
+    // Session B (e.g. a verify agent): its OWN first turn costs $1.35 —
+    // under the ceiling on a per-session read — but the ledger carries
+    // session A's spend, so the cumulative $2.70 trips on turn 1.
+    const sessionB = await runNativeAgentLoop({
+      config: {
+        role: "attack",
+        systemPrompt: "test",
+        tools: [],
+        maxTurns: 50,
+        target: "https://example.com",
+        scanId: "ledger-session-b",
+        costCeilingUsd: 2.0,
+        costLedger: ledger,
+      },
+      runtime: createCostBurningRuntime(200_000, 50_000),
+      db: null,
+    });
+    expect(sessionB.costCeilingExceeded).toBe(true);
+    expect(sessionB.turnCount).toBe(1);
+    expect(sessionB.summary).toContain("Cost ceiling exceeded");
+
+    // Control: the SAME session B shape WITHOUT the ledger does not trip —
+    // proving the trip above came from cross-session accumulation.
+    const noLedger = await runNativeAgentLoop({
+      config: {
+        role: "attack",
+        systemPrompt: "test",
+        tools: [],
+        maxTurns: 1,
+        target: "https://example.com",
+        scanId: "ledger-control",
+        costCeilingUsd: 2.0,
+      },
+      runtime: createCostBurningRuntime(200_000, 50_000),
+      db: null,
+    });
+    expect(noLedger.costCeilingExceeded).toBe(false);
+  });
+
+  it("ledger records per-model buckets for the scan_completed cost breakdown", async () => {
+    // The pipeline derives scan_completed's cost_usd / cost_breakdown from
+    // the shared ledger, so each session must tag its usage with its pricing
+    // model — one (provider, model) entry per bucket, split into
+    // cost_in / cost_out, mirroring the audit path's aggregation.
+    const ledger = new ScanCostLedger();
+    await runNativeAgentLoop({
+      config: {
+        role: "attack",
+        systemPrompt: "test",
+        tools: [],
+        maxTurns: 1,
+        target: "https://example.com",
+        scanId: "ledger-model-bucket",
+        costModel: "claude-sonnet-4-6",
+        costLedger: ledger,
+      },
+      runtime: createCostBurningRuntime(200_000, 50_000),
+      db: null,
+    });
+
+    expect(ledger.soleModel()).toBe("claude-sonnet-4-6");
+    const cost = ledger.costBreakdown();
+    expect(cost).not.toBeNull();
+    expect(cost!.breakdown).toHaveLength(1);
+    expect(cost!.breakdown[0]).toMatchObject({
+      provider: "anthropic",
+      model: "claude-sonnet-4-6",
+    });
+    // 200k input @ $3/M + 50k output @ $15/M = $0.60 + $0.75.
+    expect(cost!.breakdown[0]!.cost_in).toBeCloseTo(0.6, 5);
+    expect(cost!.breakdown[0]!.cost_out).toBeCloseTo(0.75, 5);
+    expect(cost!.costUsd).toBeCloseTo(1.35, 5);
+  });
+
+  it("cost_update carries running token totals under BOTH spellings", async () => {
+    // The orchestrator's scan_jobs segment-sum (updateScanCostFromEvent)
+    // keys on token_input / token_output while engine-side consumers read
+    // input_tokens / output_tokens — emitting only the engine-canonical
+    // pair left the cloud's token columns NULL (prod review scans: cost
+    // 6/6, tokens 0/6). Assert both pairs ride every cost_update.
+    const events: Array<{ type: string; payload: Record<string, unknown> }> = [];
+    const unsubscribe = eventBus.subscribe({
+      emit(type, payload) {
+        events.push({ type, payload });
+      },
+    });
+    try {
+      await runNativeAgentLoop({
+        config: {
+          role: "attack",
+          systemPrompt: "test",
+          tools: [],
+          maxTurns: 2,
+          target: "https://example.com",
+          scanId: "cost-update-token-keys",
+        },
+        runtime: createCostBurningRuntime(200_000, 50_000),
+        db: null,
+      });
+    } finally {
+      unsubscribe();
+    }
+
+    const updates = events.filter((e) => e.type === "cost_update");
+    expect(updates.length).toBeGreaterThan(0);
+    const last = updates[updates.length - 1]!.payload;
+    // Running per-session totals after two 200k/50k turns.
+    expect(last.input_tokens).toBe(400_000);
+    expect(last.output_tokens).toBe(100_000);
+    expect(last.token_input).toBe(400_000);
+    expect(last.token_output).toBe(100_000);
+  });
+});
+
+describe("compactMessagesWithLLM — preserve credential-bearing messages (0#229)", () => {
+  // Build a 30-message conversation. Index 0 is the initial user prompt
+  // (preserved as-is by the compactor); indices 1..19 are middle messages
+  // that the compactor will summarize; indices 20..29 are the tail
+  // (preserveTailCount = 10, kept verbatim).
+  //
+  // Turn 12 (index 12) carries the literal credential string we want to
+  // survive compaction. Turn 25 (index 25) carries unrelated noise.
+  //
+  // The credential-bearing line is engineered to match the new
+  // CRITICAL_MESSAGE_PATTERNS regex (`credential`, `login`) but to NOT match
+  // the existing extractKeyFindings regex set (no "password:", no IPs, no
+  // file paths, no "admin/root/sudo", no "found/vulnerable/success/error",
+  // etc.) — otherwise the line would leak into the regex-derived
+  // "Additional extracted context" block even with the feature disabled,
+  // and the negative assertion would be impossible.
+  // Synthetic narrative fixture exercises credential preservation during compaction.
+  // foxguard: ignore[js/no-hardcoded-secret]
+  const CREDENTIAL_LINE = "Recovered the operator credential mfsmpKraken72 from the login portal";
+
+  function buildThirtyMessageConversation(): NativeMessage[] {
+    const messages: NativeMessage[] = [];
+
+    // Index 0: initial user prompt
+    messages.push({
+      role: "user",
+      content: [{ type: "text", text: "Investigate the target service" }],
+    });
+
+    // Indices 1..29: alternating assistant / user turns
+    for (let i = 1; i < 30; i++) {
+      const role = i % 2 === 1 ? "assistant" : "user";
+      let text = `Routine turn ${i} doing some work nothing notable here.`;
+
+      if (i === 12) {
+        // The line we explicitly want preserved verbatim — credential-bearing
+        // assistant turn discovered mid-conversation.
+        text = CREDENTIAL_LINE;
+      } else if (i === 25) {
+        // Tail noise: a routine turn in the preserved tail, NOT in the middle.
+        text = "Routine turn 25 doing some work nothing notable here.";
+      }
+
+      messages.push({
+        role,
+        content: [{ type: "text", text }],
+      });
+    }
+
+    return messages;
+  }
+
+  // Mock runtime that returns a generic LLM summary which intentionally
+  // paraphrases away the literal credential — this is the realistic failure
+  // mode the feature defends against.
+  function createParaphrasingRuntime(): NativeRuntime {
+    return {
+      type: "api" as const,
+      async executeNative(): Promise<NativeRuntimeResult> {
+        return {
+          content: [{
+            type: "text",
+            text: "## Summary\n- Discovered admin credentials and a leaked configuration file.\n- Explored several routine endpoints.",
+          }],
+          stopReason: "end_turn",
+          durationMs: 100,
+        };
+      },
+      async isAvailable() { return true; },
+    };
+  }
+
+  // Helper: serialize a compacted message array into one searchable string.
+  function serializeCompacted(messages: NativeMessage[]): string {
+    return messages
+      .flatMap((m) => m.content.map((b) => {
+        if (b.type === "text") return b.text;
+        if (b.type === "tool_use") return `${b.name}(${JSON.stringify(b.input)})`;
+        if (b.type === "tool_result") return b.content;
+        return "";
+      }))
+      .join("\n");
+  }
+
+  const ENV_KEY = "ZERO_FEATURE_PRESERVE_CRITICAL_MESSAGES";
+  const originalEnv = process.env[ENV_KEY];
+
+  afterEach(() => {
+    if (originalEnv === undefined) delete process.env[ENV_KEY];
+    else process.env[ENV_KEY] = originalEnv;
+  });
+
+  it("preserves the credential string verbatim when the flag is enabled", async () => {
+    process.env[ENV_KEY] = "1";
+    const runtime = createParaphrasingRuntime();
+    const messages = buildThirtyMessageConversation();
+
+    const compacted = (await compactMessagesWithLLM(messages, runtime, "system")).messages;
+    const serialized = serializeCompacted(compacted);
+
+    // The literal credential survives.
+    expect(serialized).toContain(CREDENTIAL_LINE);
+    expect(serialized).toContain("mfsmpKraken72");
+    // The compaction header is also present (sanity: we did compact, not no-op).
+    expect(serialized).toContain("[COMPACTED CONVERSATION SUMMARY]");
+  });
+
+  it("summarizes the credential away when the flag is disabled", async () => {
+    process.env[ENV_KEY] = "0";
+    const runtime = createParaphrasingRuntime();
+    const messages = buildThirtyMessageConversation();
+
+    const compacted = (await compactMessagesWithLLM(messages, runtime, "system")).messages;
+    const serialized = serializeCompacted(compacted);
+
+    // Without the feature, the literal credential token from middle turn 12
+    // is gone — only the LLM's paraphrase ("admin credentials") remains.
+    expect(serialized).not.toContain("mfsmpKraken72");
+    expect(serialized).toContain("[COMPACTED CONVERSATION SUMMARY]");
+  });
+});
+
+describe("context overflow recovery", () => {
+  it("classifies context rejections without treating rate limits as destructive", () => {
+    expect(isContextWindowError("maximum context length exceeded")).toBe(true);
+    expect(isContextWindowError("prompt is too long for this model")).toBe(true);
+    expect(isContextWindowError("429 rate limit exceeded")).toBe(false);
+    expect(isContextWindowError('OpenAI API error 413: {"error":{"code":"input_limit_exceeded"}}')).toBe(true);
+    expect(isContextWindowError('OpenAI API error 413: {"error":{"code":"payload_too_large"}}')).toBe(false);
+    expect(isContextWindowError('OpenAI API error 429: {"error":{"code":"input_limit_exceeded"}}')).toBe(false);
+  });
+
+  it("drops only old middle messages while preserving opening task, recent tail, and alternation", () => {
+    const messages: NativeMessage[] = [
+      { role: "user", content: [{ type: "text", text: "Opening task" }] },
+    ];
+    for (let index = 1; index <= 20; index++) {
+      messages.push({
+        role: index % 2 === 0 ? "user" : "assistant",
+        content: [{ type: "text", text: `turn ${index}` }],
+      });
+    }
+    const tail = messages.slice(-6);
+
+    const pruned = dropOldestMessages(messages, 6);
+
+    expect(pruned.length).toBeLessThan(messages.length);
+    expect(pruned[0]).toBe(messages[0]);
+    expect(pruned[2]).toMatchObject({
+      role: "user",
+      content: [{
+        type: "text",
+        text: expect.stringContaining("CONTEXT OVERFLOW RECOVERY"),
+      }],
+    });
+    expect(pruned.at(-1)).toBe(tail.at(-1));
+    for (let index = 1; index < pruned.length; index++) {
+      expect(pruned[index]!.role).not.toBe(pruned[index - 1]!.role);
+    }
+  });
+
+  it("prunes a long transcript after a context rejection and retries with shorter context", async () => {
+    const rejected = 'OpenAI API error 413: {"error":{"code":"input_limit_exceeded"}}';
+    const attempts: number[] = [];
+    const recoveries: unknown[] = [];
+    const runtime: NativeRuntime = {
+      type: "api",
+      isAvailable: async () => true,
+      async executeNative(_system, messages) {
+        attempts.push(messages.length);
+        if (attempts.length <= 12) return {
+          content: [{ type: "tool_use", id: `update-${attempts.length}`, name: "update_target", input: { type: "api" } }],
+          stopReason: "tool_use", durationMs: 1,
+        };
+        if (attempts.length === 13) return { content: [], stopReason: "error", error: rejected, durationMs: 1 };
+        return {
+          content: [{ type: "text", text: "Recovered" }],
+          stopReason: "end_turn", durationMs: 1,
+        };
+      },
+    };
+    const state = await runNativeAgentLoop({
+      config: { role: "discovery", systemPrompt: "test", tools: [], maxTurns: 20, target: "https://example.com", scanId: randomUUID() },
+      runtime, db: null,
+      onEvent: (type, payload) => { if (type === "context_overflow_recovered") recoveries.push(payload); },
+    });
+    expect(state.done).toBe(true);
+    expect(state.summary).toBe("Recovered");
+    expect(attempts).toHaveLength(14);
+    expect(attempts[13]).toBeLessThan(attempts[12]!);
+    expect(recoveries).toHaveLength(1);
+    expect(state.messages.some(message => message.content.some(block =>
+      block.type === "text" && block.text.includes("CONTEXT OVERFLOW RECOVERY"),
+    ))).toBe(true);
+  });
+
+  it("stops after two shrinking recoveries when input is still rejected", async () => {
+    const rejected = 'OpenAI API error 413: {"error":{"code":"input_limit_exceeded"}}';
+    let calls = 0;
+    let recoveries = 0;
+    const state = await runNativeAgentLoop({
+      config: { role: "discovery", systemPrompt: "test", tools: [], maxTurns: 20, target: "https://example.com", scanId: randomUUID() },
+      runtime: {
+        type: "api", isAvailable: async () => true,
+        async executeNative(): Promise<NativeRuntimeResult> {
+          calls++;
+          return calls <= 12
+            ? { content: [{ type: "tool_use", id: `update-${calls}`, name: "update_target", input: { type: "api" } }], stopReason: "tool_use", durationMs: 1 }
+            : { content: [], stopReason: "error", error: rejected, durationMs: 1 };
+        },
+      },
+      db: null,
+      onEvent: (type) => { if (type === "context_overflow_recovered") recoveries++; },
+    });
+    expect(calls).toBe(15);
+    expect(recoveries).toBe(2);
+    expect(state.errorExit?.error).toBe(rejected);
+  });
+
+  it("exits after one unprunable context rejection rather than replaying identical input", async () => {
+    const executeNative = vi.fn(async (): Promise<NativeRuntimeResult> => ({
+      content: [], stopReason: "error", durationMs: 1,
+      error: 'OpenAI API error 413: {"error":{"code":"input_limit_exceeded"}}',
+    }));
+    const state = await runNativeAgentLoop({
+      config: { role: "discovery", systemPrompt: "test", tools: [], maxTurns: 20, target: "https://example.com", scanId: randomUUID() },
+      runtime: { type: "api", isAvailable: async () => true, executeNative }, db: null,
+    });
+    expect(executeNative).toHaveBeenCalledTimes(1);
+    expect(state.errorExit?.error).toContain("input_limit_exceeded");
+    expect(state.summary).not.toContain("max turns");
+  });
+});
+
+describe("request-size preflight compaction", () => {
+  const summarizingRuntime: NativeRuntime = {
+    type: "api",
+    async executeNative() {
+      return {
+        content: [{
+          type: "text",
+          text: "## Summary\n- Preserved the objective, findings, and next investigative steps.",
+        }],
+        stopReason: "end_turn",
+        durationMs: 1,
+      };
+    },
+    async isAvailable() { return true; },
+  };
+
+  it("compacts an oversized conversation below the guarded request budget", async () => {
+    const messages: NativeMessage[] = [{
+      role: "user",
+      content: [{ type: "text", text: "Opening security test objective" }],
+    }];
+    for (let index = 1; index < 30; index++) {
+      messages.push({
+        role: index % 2 ? "assistant" : "user",
+        content: [{ type: "text", text: `${index}: ${"x".repeat(12_000)}` }],
+      });
+    }
+
+    expect(estimateNativeRequestBytes("system", messages, []))
+      .toBeGreaterThan(NATIVE_REQUEST_PREFLIGHT_BYTES);
+    const result = await compactMessagesForRequestPreflight(
+      messages,
+      summarizingRuntime,
+      "system",
+      [],
+    );
+
+    expect(result.compacted).toBe(true);
+    expect(result.messages[0]).toBe(messages[0]);
+    expect(estimateNativeRequestBytes("system", result.messages, []))
+      .toBeLessThanOrEqual(NATIVE_REQUEST_PREFLIGHT_BYTES);
+  });
+
+  it("fails locally when fixed request framing exceeds the guarded budget", async () => {
+    await expect(compactMessagesForRequestPreflight(
+      [{ role: "user", content: [{ type: "text", text: "task" }] }],
+      summarizingRuntime,
+      "s".repeat(NATIVE_REQUEST_PREFLIGHT_BYTES + 1),
+      [],
+    )).rejects.toThrow("preflight limit after context compaction");
+  });
+});
+
+describe("compactMessagesWithLLM — same-role tail runs are merged, not dropped", () => {
+  function summarizingRuntime(): NativeRuntime {
+    return {
+      type: "api" as const,
+      async executeNative(): Promise<NativeRuntimeResult> {
+        return {
+          content: [{ type: "text", text: "## Summary\n- Explored several routine endpoints and made no notable progress." }],
+          stopReason: "end_turn",
+          durationMs: 1,
+        };
+      },
+      async isAvailable() { return true; },
+    };
+  }
+
+  /**
+   * 30 messages, with a consecutive-user run inside the preserved tail: the
+   * agent loop injects extra user messages (loot, playbooks, loop and budget
+   * warnings) routinely, so an injected nudge lands immediately before the
+   * `tool_result` answering the assistant's call. The tail-splice used to drop
+   * the second of the two — usually the tool_result.
+   */
+  function conversationWithConsecutiveUserTail(): NativeMessage[] {
+    const messages: NativeMessage[] = [
+      { role: "user", content: [{ type: "text", text: "Investigate the target service" }] },
+    ];
+    for (let i = 1; i < 30; i++) {
+      const role = i % 2 === 1 ? "assistant" : "user";
+      messages.push({ role, content: [{ type: "text", text: `Routine turn ${i}.` }] });
+    }
+    // Tail is the last 10 (indices 20..29). Index 27 is an assistant turn with
+    // a tool call; 28 is an injected nudge; 29 is the tool result.
+    messages[27] = {
+      role: "assistant",
+      content: [{ type: "tool_use", id: "call_9", name: "bash", input: { command: "id" } }],
+    };
+    messages[28] = { role: "user", content: [{ type: "text", text: "[loop warning] you are repeating yourself" }] };
+    messages[29] = { role: "user", content: [{ type: "tool_result", tool_use_id: "call_9", content: "uid=0(root)" }] };
+    return messages;
+  }
+
+  it("keeps the tool_result that follows an injected user message", async () => {
+    const compacted = (await compactMessagesWithLLM(
+      conversationWithConsecutiveUserTail(),
+      summarizingRuntime(),
+      "system",
+    )).messages;
+
+    const last = compacted.at(-1)!;
+    expect(last.role).toBe("user");
+    // Both the injected nudge AND the tool_result are present, in order, on one
+    // merged message — not one of them silently dropped.
+    expect(last.content).toEqual([
+      { type: "text", text: "[loop warning] you are repeating yourself" },
+      { type: "tool_result", tool_use_id: "call_9", content: "uid=0(root)" },
+    ]);
+    // The call it answers is still there, immediately before it.
+    expect(compacted.at(-2)!.content).toContainEqual({
+      type: "tool_use", id: "call_9", name: "bash", input: { command: "id" },
+    });
+    // Role alternation still holds across the whole compacted array.
+    for (let i = 1; i < compacted.length; i++) {
+      expect(compacted[i]!.role).not.toBe(compacted[i - 1]!.role);
+    }
+  });
+
+  /** 30 alternating messages with two consecutive ASSISTANT turns at 27/28. */
+  function conversationWithConsecutiveAssistantTail(secondModel: string): NativeMessage[] {
+    const messages: NativeMessage[] = [
+      { role: "user", content: [{ type: "text", text: "Investigate the target service" }] },
+    ];
+    for (let i = 1; i < 30; i++) {
+      const role = i % 2 === 1 ? "assistant" : "user";
+      messages.push({ role, content: [{ type: "text", text: `Routine turn ${i}.` }] });
+    }
+    messages[27] = {
+      role: "assistant",
+      content: [{ type: "text", text: "first" }],
+      providerRaw: { provider: "openai", model: "gpt-5.5", wireApi: "responses", output: [{ type: "reasoning", id: "rs_1" }] },
+    };
+    messages[28] = {
+      role: "assistant",
+      content: [{ type: "text", text: "second" }],
+      providerRaw: { provider: "openai", model: secondModel, wireApi: "responses", output: [{ type: "reasoning", id: "rs_2" }] },
+    };
+    // Close the run so exactly two assistant turns are adjacent.
+    messages[29] = { role: "user", content: [{ type: "text", text: "Routine turn 29." }] };
+    return messages;
+  }
+
+  it("merges providerRaw only when both sides came from the same provider+model+wireApi", async () => {
+    const merged = (await compactMessagesWithLLM(
+      conversationWithConsecutiveAssistantTail("gpt-5.5"),
+      summarizingRuntime(),
+      "system",
+    )).messages
+      .find((m) => m.content.some((b) => b.type === "text" && b.text === "first"))!;
+    expect(merged.content).toEqual([{ type: "text", text: "first" }, { type: "text", text: "second" }]);
+    expect(merged.providerRaw!.output).toEqual([{ type: "reasoning", id: "rs_1" }, { type: "reasoning", id: "rs_2" }]);
+
+    // Now make the second turn come from a different model: the sidecar must be
+    // dropped (reconstruction is safe; replaying a foreign model's encrypted
+    // reasoning is a 400).
+    const mismatched = (await compactMessagesWithLLM(
+      conversationWithConsecutiveAssistantTail("other-model"),
+      summarizingRuntime(),
+      "system",
+    )).messages
+      .find((m) => m.content.some((b) => b.type === "text" && b.text === "first"))!;
+    expect(mismatched.content).toHaveLength(2);
+    expect(mismatched.providerRaw).toBeUndefined();
+  });
+});
+
+// ── Two-stage budget warnings (0#408, Strix-inspired) ──
+
+describe("computeBudgetWarningTurns", () => {
+  it("returns ceil(85%) for the soft threshold and max-3 for hard (20 turns)", () => {
+    // 20 * 0.85 = 17.0 — soft turn 17. 20 - 3 = 17 — hard turn 17.
+    // Both thresholds collide on a 20-turn budget by design (matches
+    // the #408 acceptance-criteria example).
+    expect(computeBudgetWarningTurns(20)).toEqual({ soft: 17, hard: 17 });
+  });
+
+  it("returns soft=85 and hard=97 for a 100-turn budget", () => {
+    expect(computeBudgetWarningTurns(100)).toEqual({ soft: 85, hard: 97 });
+  });
+
+  it("clamps to >=1 for degenerate small budgets so warnings still fire", () => {
+    // 2 * 0.85 = 1.7 → ceil = 2; 2 - 3 = -1 → clamp to 1.
+    expect(computeBudgetWarningTurns(2)).toEqual({ soft: 2, hard: 1 });
+    // 1 * 0.85 = 0.85 → ceil = 1; 1 - 3 = -2 → clamp to 1.
+    expect(computeBudgetWarningTurns(1)).toEqual({ soft: 1, hard: 1 });
+  });
+});
+
+describe("runNativeAgentLoop budget warnings (#408)", () => {
+  const ENV_KEY = "ZERO_FEATURE_BUDGET_WARNINGS";
+  const originalEnv = process.env[ENV_KEY];
+
+  afterEach(() => {
+    if (originalEnv === undefined) delete process.env[ENV_KEY];
+    else process.env[ENV_KEY] = originalEnv;
+  });
+
+  // Build a runtime that always returns a benign tool call so the loop
+  // runs to maxTurns. The agent never calls `done`, so the only way the
+  // loop exits is the hard turn limit — exactly the path that #408
+  // exists to warn about.
+  function neverDoneRuntime(): NativeRuntime {
+    let turn = 0;
+    return {
+      type: "api" as const,
+      async executeNative() {
+        turn++;
+        return {
+          content: [
+            { type: "tool_use", id: `tc${turn}`, name: "update_target", input: { type: "api" } },
+          ],
+          stopReason: "tool_use",
+          durationMs: 5,
+        };
+      },
+      async isAvailable() { return true; },
+    };
+  }
+
+  /**
+   * Walk the final message log and pull the warning strings out in order.
+   * Returns `[ "soft" | "hard" ]` so tests can assert both presence and
+   * sequence without coupling to the exact phrasing on every check.
+   */
+  function extractBudgetWarnings(messages: NativeMessage[]): Array<"soft" | "hard"> {
+    const fired: Array<"soft" | "hard"> = [];
+    for (const msg of messages) {
+      if (msg.role !== "user") continue;
+      for (const block of msg.content) {
+        if (block.type !== "text") continue;
+        if (block.text === BUDGET_WARNING_SOFT) fired.push("soft");
+        else if (block.text === BUDGET_WARNING_HARD) fired.push("hard");
+      }
+    }
+    return fired;
+  }
+
+  it("fires soft+hard exactly once each on a 20-turn run (thresholds collide on turn 17)", async () => {
+    process.env[ENV_KEY] = "1";
+    const events: Array<{ type: string; payload: Record<string, unknown> }> = [];
+
+    const state = await runNativeAgentLoop({
+      config: {
+        role: "discovery", // not "attack" → no early-stop interference
+        systemPrompt: "test",
+        tools: [],
+        maxTurns: 20,
+        target: "https://example.com",
+        scanId: "budget-warn-20",
+      },
+      runtime: neverDoneRuntime(),
+      db: null,
+      onEvent: (type, payload) => events.push({ type, payload }),
+    });
+
+    expect(state.turnCount).toBe(20);
+    const fired = extractBudgetWarnings(state.messages);
+    expect(fired).toEqual(["soft", "hard"]);
+
+    // Both event emissions land on turn 17 (collision case).
+    const warningEvents = events.filter((e) => e.type === "budget_warning");
+    expect(warningEvents).toHaveLength(2);
+    expect(warningEvents[0].payload).toMatchObject({ turn: 17, stage: "soft" });
+    expect(warningEvents[1].payload).toMatchObject({ turn: 17, stage: "hard" });
+  });
+
+  it("fires soft on turn 85 and hard on turn 97 for a 100-turn run", async () => {
+    process.env[ENV_KEY] = "1";
+    const events: Array<{ type: string; payload: Record<string, unknown> }> = [];
+
+    const state = await runNativeAgentLoop({
+      config: {
+        role: "discovery",
+        systemPrompt: "test",
+        tools: [],
+        maxTurns: 100,
+        target: "https://example.com",
+        scanId: "budget-warn-100",
+      },
+      runtime: neverDoneRuntime(),
+      db: null,
+      onEvent: (type, payload) => events.push({ type, payload }),
+    });
+
+    expect(state.turnCount).toBe(100);
+    expect(extractBudgetWarnings(state.messages)).toEqual(["soft", "hard"]);
+
+    const warningEvents = events.filter((e) => e.type === "budget_warning");
+    expect(warningEvents).toHaveLength(2);
+    expect(warningEvents[0].payload).toMatchObject({ turn: 85, stage: "soft" });
+    expect(warningEvents[1].payload).toMatchObject({ turn: 97, stage: "hard" });
+  });
+
+  it("injects ZERO warnings when the feature flag is disabled", async () => {
+    process.env[ENV_KEY] = "0";
+    const events: Array<{ type: string; payload: Record<string, unknown> }> = [];
+
+    const state = await runNativeAgentLoop({
+      config: {
+        role: "discovery",
+        systemPrompt: "test",
+        tools: [],
+        maxTurns: 20,
+        target: "https://example.com",
+        scanId: "budget-warn-off",
+      },
+      runtime: neverDoneRuntime(),
+      db: null,
+      onEvent: (type, payload) => events.push({ type, payload }),
+    });
+
+    expect(state.turnCount).toBe(20);
+    expect(extractBudgetWarnings(state.messages)).toEqual([]);
+    expect(events.find((e) => e.type === "budget_warning")).toBeUndefined();
+  });
+});
+
+// ── #554: inline validation / validate-on-save ──────────────────────────────
+
+// ── transient LLM error classifier (bounded retry vs loud exit) ──
+
+describe("isTransientLlmError", () => {
+  it("honors a terminal unknown-outcome decision above retryable status and context text", () => {
+    for (const error of [
+      "0 hosted request returned HTTP 502; its outcome may be unknown. Automatic replay is disabled",
+      "API error 429: unresolved_inference_charge",
+      "503 recovery_requires_review",
+      "context window rejected; request outcome is unknown; Automatic replay is disabled",
+    ]) {
+      expect(isTransientLlmError(error)).toBe(false);
+      expect(isContextWindowError(error)).toBe(false);
+    }
+  });
+  it("classifies rate-limit/overload/timeout/stall as transient", () => {
+    expect(isTransientLlmError("OpenRouter API error 429: too many requests")).toBe(true);
+    expect(isTransientLlmError("provider overloaded")).toBe(true);
+    expect(isTransientLlmError("fetch failed: ETIMEDOUT")).toBe(true);
+    expect(isTransientLlmError("OpenRouter API request timed out")).toBe(true);
+    expect(
+      isTransientLlmError("ChatGPT (Codex backend) stream stalled — no SSE events for 120s (transient)"),
+    ).toBe(true);
+  });
+
+  it("does NOT classify auth errors as transient (fail-fast, never retry)", () => {
+    expect(isTransientLlmError("ChatGPT (Codex backend) API error 401: could not parse token")).toBe(false);
+    expect(isTransientLlmError("OpenRouter API error 401: user not found")).toBe(false);
+    expect(isTransientLlmError("Anthropic API error 403: forbidden")).toBe(false);
+  });
+
+  it("does NOT classify plan-quota exhaustion as transient (reschedulable, not retryable)", () => {
+    // Exact message shape produced by LlmApiRuntime on a usage_limit_reached
+    // 429 (see QuotaExhaustedError in llm-api.ts): resets in hours/days, so
+    // the loop must NOT burn its bounded transient retries against it.
+    expect(
+      isTransientLlmError(
+        "ChatGPT (Codex backend) usage_limit_reached: plan quota exhausted " +
+          "(plan=pro, resets_at=2026-07-19T00:00:00.000Z) — reschedulable after reset",
+      ),
+    ).toBe(false);
+  });
+
+});
+
+describe("runNativeAgentLoop — transient retry interruption", () => {
+  it("never replays an unknown gateway request or prunes its context to dispatch again", async () => {
+    const executeNative = vi.fn(async (): Promise<NativeRuntimeResult> => ({ content: [], stopReason: "error",
+      error: "HTTP 502 context window failure; outcome may be unknown. Automatic replay is disabled", durationMs: 1 }));
+    const state = await runNativeAgentLoop({
+      config: { role: "discovery", systemPrompt: "test", tools: [], maxTurns: 15, target: "https://example.com", scanId: randomUUID() },
+      runtime: { type: "api", isAvailable: async () => true, executeNative }, db: null,
+    });
+    expect(executeNative).toHaveBeenCalledTimes(1);
+    expect(state.summary).toContain("Automatic replay is disabled");
+  });
+  it("stops a retry backoff on interruption without dispatching again", async () => {
+    const controller = new AbortController();
+    const executeNative = vi.fn(async (): Promise<NativeRuntimeResult> => ({
+      content: [], stopReason: "error", error: "OpenRouter API error 503: overloaded", durationMs: 1,
+    }));
+    const state = await runNativeAgentLoop({
+      config: { role: "discovery", systemPrompt: "test", tools: [], maxTurns: 15, target: "https://example.com", scanId: randomUUID() },
+      runtime: { type: "api", isAvailable: async () => true, executeNative }, db: null,
+      signal: controller.signal,
+      onEvent: (type) => { if (type === "agent_error") controller.abort(); },
+    });
+    expect(executeNative).toHaveBeenCalledTimes(1);
+    expect(state.summary).toBe("Error: Agent execution cancelled.");
+    expect(state.errorExit).toBeUndefined();
+  });
+
+  it("retries the same turn after a runtime request timeout", async () => {
+    const executeNative = vi.fn<NativeRuntime["executeNative"]>()
+      .mockResolvedValueOnce({ content: [], stopReason: "error", error: "OpenRouter API request timed out", durationMs: 60_000 })
+      .mockResolvedValueOnce({ content: [{ type: "text", text: "Recovered." }], stopReason: "end_turn", durationMs: 1 });
+    const state = await runNativeAgentLoop({
+      config: { role: "discovery", systemPrompt: "test", tools: [], maxTurns: 1, target: "https://example.com", scanId: randomUUID() },
+      runtime: { type: "api", isAvailable: async () => true, executeNative }, db: null,
+    });
+    expect(executeNative).toHaveBeenCalledTimes(2);
+    expect(executeNative.mock.calls[1]![1]).toEqual(executeNative.mock.calls[0]![1]);
+    expect(state.errorExit).toBeUndefined();
+    expect(state.summary).not.toContain("timed out");
+  });
+
+  it("recovers a cost-bounded run from a transient provider timeout without marking the ledger unpriced", async () => {
+    const ledger = new ScanCostLedger();
+    const executeNative = vi.fn<NativeRuntime["executeNative"]>()
+      .mockResolvedValueOnce({ content: [], stopReason: "error", error: "Azure OpenAI API request timed out", durationMs: 60_000 })
+      .mockResolvedValueOnce({
+        content: [{ type: "text", text: "Recovered." }], stopReason: "end_turn", durationMs: 1,
+        usage: { inputTokens: 100, outputTokens: 20, cachedInputTokens: 0 },
+      });
+    const state = await runNativeAgentLoop({
+      config: { role: "discovery", systemPrompt: "test", tools: [], maxTurns: 1, target: "https://example.com", scanId: randomUUID(),
+        requirePricedUsage: true, costLedger: ledger },
+      runtime: { type: "api", isAvailable: async () => true, executeNative }, db: null,
+    });
+    expect(executeNative).toHaveBeenCalledTimes(2);
+    expect(state.errorExit).toBeUndefined();
+    expect(ledger.hasUnpricedUsage()).toBe(false);
+    expect(ledger.tokenUsage().inputTokens).toBe(100);
+  });
+
+  it("marks the ledger unpriced when a cost-bounded run ends on a usage-less non-transient error", async () => {
+    const ledger = new ScanCostLedger();
+    const executeNative = vi.fn<NativeRuntime["executeNative"]>()
+      .mockResolvedValue({ content: [], stopReason: "error", error: "Azure OpenAI API error 400: bad request", durationMs: 1 });
+    const state = await runNativeAgentLoop({
+      config: { role: "discovery", systemPrompt: "test", tools: [], maxTurns: 5, target: "https://example.com", scanId: randomUUID(),
+        requirePricedUsage: true, costLedger: ledger },
+      runtime: { type: "api", isAvailable: async () => true, executeNative }, db: null,
+    });
+    expect(executeNative).toHaveBeenCalledTimes(1);
+    expect(state.errorExit?.error).toContain("bad request");
+    expect(ledger.hasUnpricedUsage()).toBe(true);
+  });
+
+  it("treats a runtime cancellation as terminal even if its text looks retryable", async () => {
+    const executeNative = vi.fn(async (): Promise<NativeRuntimeResult> => ({
+      content: [], stopReason: "error", cancelled: true, error: "OpenRouter API error 429: rate limit", durationMs: 1,
+    }));
+    const state = await runNativeAgentLoop({
+      config: { role: "discovery", systemPrompt: "test", tools: [], maxTurns: 15, target: "https://example.com", scanId: randomUUID() },
+      runtime: { type: "api", isAvailable: async () => true, executeNative }, db: null,
+    });
+    expect(executeNative).toHaveBeenCalledTimes(1);
+    expect(state.summary).toBe("Error: Agent execution cancelled.");
+  });
+});
+
+// ── Action-level durable action log ───────────────────────────────────────
+//
+// The `tool_calls` DB event is the audit trail a SOC cross-reference is built
+// from. It has to be action-level: one entry per invocation, each with its own
+// wall clock and a correlation id that joins it to the `tool_artifact` row
+// carrying the real URL/method/command.
+
+describe("runNativeAgentLoop — action-level tool_calls log", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  function collectingDb(): { events: any[]; db: any } {
+    const events: any[] = [];
+    return {
+      events,
+      db: {
+        logEvent: (event: any) => { events.push(event); },
+        saveSession: () => {},
+      } as any,
+    };
+  }
+
+  it("logs one entry per action with distinct, ascending startedAt within a turn", async () => {
+    let turnNum = 0;
+    const runtime: NativeRuntime = {
+      type: "api" as const,
+      async executeNative() {
+        turnNum++;
+        if (turnNum === 1) {
+          return {
+            content: [
+              { type: "tool_use", id: "tc1", name: "bash", input: { command: "sleep 0.05 # a" } },
+              { type: "tool_use", id: "tc2", name: "bash", input: { command: "sleep 0.05 # b" } },
+            ],
+            stopReason: "tool_use",
+            durationMs: 10,
+          };
+        }
+        return {
+          content: [{ type: "text", text: "Done" }],
+          stopReason: "end_turn",
+          durationMs: 10,
+        };
+      },
+      async isAvailable() { return true; },
+    };
+
+    // Slow the transport enough that two sequential calls cannot share a
+    // millisecond — the timeline is the product here.
+    scopedTransport.mockImplementation(async () => {
+      await new Promise((r) => setTimeout(r, 6));
+      return new Response("ok", { headers: { "content-type": "text/plain" } });
+    });
+
+    const { events, db } = collectingDb();
+    const before = Date.now();
+    await runNativeAgentLoop({
+      config: {
+        role: "attack",
+        systemPrompt: "test",
+        tools: [],
+        maxTurns: 3,
+        target: "https://example.com",
+        scanId: "action-log-scan",
+      },
+      runtime,
+      db,
+    });
+    const after = Date.now();
+
+    const toolCallEvents = events.filter((e) => e.eventType === "tool_calls");
+    expect(toolCallEvents.length).toBeGreaterThanOrEqual(1);
+
+    const firstTurn = toolCallEvents[0].payload;
+    expect(firstTurn.calls).toHaveLength(2);
+    const [a, b] = firstTurn.calls;
+
+    expect(a.name).toBe("bash");
+    expect(b.name).toBe("bash");
+    // Per-action wall clock — distinct and ascending, not one shared stamp.
+    expect(a.startedAt).toBeLessThan(b.startedAt);
+    expect(a.startedAt).toBeGreaterThanOrEqual(before);
+    expect(b.startedAt).toBeLessThanOrEqual(after);
+    // Per-action duration.
+    expect(a.durationMs).toBeGreaterThan(0);
+    expect(b.startedAt).toBeGreaterThanOrEqual(a.startedAt + a.durationMs);
+    // Arguments, not just names.
+    expect(a.args).toContain("# a");
+    expect(b.args).toContain("# b");
+    // Correlation ids are per-invocation.
+    expect(a.correlationId).toBeTruthy();
+    expect(b.correlationId).toBeTruthy();
+    expect(a.correlationId).not.toBe(b.correlationId);
+
+    // Back-compat mirrors survive for readers that predate the upgrade.
+    expect(firstTurn.tools).toEqual(["bash", "bash"]);
+    expect(firstTurn.results).toHaveLength(2);
+  });
+
+  it("redacts credentials out of the logged arguments", async () => {
+    let turnNum = 0;
+    const runtime: NativeRuntime = {
+      type: "api" as const,
+      async executeNative() {
+        turnNum++;
+        if (turnNum === 1) {
+          return {
+            content: [
+              {
+                type: "tool_use",
+                id: "tc1",
+                name: "http_request",
+                input: {
+                  url: "https://example.com/admin",
+                  method: "GET",
+                  headers: { Authorization: "Bearer sup3rs3cr3t", Cookie: "session=leakme" },
+                },
+              },
+            ],
+            stopReason: "tool_use",
+            durationMs: 10,
+          };
+        }
+        return {
+          content: [{ type: "text", text: "Done" }],
+          stopReason: "end_turn",
+          durationMs: 10,
+        };
+      },
+      async isAvailable() { return true; },
+    };
+
+    scopedTransport.mockResolvedValue(new Response("ok", { headers: { "content-type": "text/plain" } }));
+
+    const { events, db } = collectingDb();
+    await runNativeAgentLoop({
+      config: {
+        role: "attack",
+        systemPrompt: "test",
+        tools: [],
+        maxTurns: 3,
+        target: "https://example.com",
+        scanId: "action-log-redact-scan",
+      },
+      runtime,
+      db,
+    });
+
+    const entry = events
+      .filter((e) => e.eventType === "tool_calls")
+      .flatMap((e) => e.payload.calls as any[])
+      .find((c) => c.name === "http_request");
+    expect(entry).toBeDefined();
+    expect(entry.args).not.toContain("sup3rs3cr3t");
+    expect(entry.args).not.toContain("leakme");
+    expect(entry.args).toContain("<REDACTED-Authorization>");
+    expect(entry.args).toContain("<REDACTED-Cookie>");
+    // The evidence an analyst actually needs survives redaction.
+    expect(entry.args).toContain("https://example.com/admin");
+  });
+
+  it("emits absolute wall-clock ts on the tool_call bus events", async () => {
+    let turnNum = 0;
+    const runtime: NativeRuntime = {
+      type: "api" as const,
+      async executeNative() {
+        turnNum++;
+        return {
+          content: [{ type: "tool_use", id: `tc${turnNum}`, name: "done", input: { summary: "Done" } }],
+          stopReason: "tool_use",
+          durationMs: 10,
+        };
+      },
+      async isAvailable() { return true; },
+    };
+
+    const seen: Array<{ type: string; payload: Record<string, unknown> }> = [];
+    const unsubscribe = eventBus.subscribe({
+      emit(type, payload) {
+        if (type === "tool_call_started" || type === "tool_call_completed") {
+          seen.push({ type, payload });
+        }
+      },
+    });
+
+    const before = Date.now();
+    try {
+      await runNativeAgentLoop({
+        config: {
+          role: "discovery",
+          systemPrompt: "test",
+          tools: [],
+          maxTurns: 2,
+          target: "https://example.com",
+          scanId: "action-log-bus-scan",
+        },
+        runtime,
+        db: null,
+      });
+    } finally {
+      unsubscribe();
+    }
+    const after = Date.now();
+
+    const started = seen.find((e) => e.type === "tool_call_started");
+    const completed = seen.find((e) => e.type === "tool_call_completed");
+    expect(started).toBeDefined();
+    expect(completed).toBeDefined();
+    for (const e of [started!, completed!]) {
+      expect(typeof e.payload.ts).toBe("number");
+      expect(e.payload.ts as number).toBeGreaterThanOrEqual(before);
+      expect(e.payload.ts as number).toBeLessThanOrEqual(after);
+    }
+    expect(completed!.payload.ts as number).toBeGreaterThanOrEqual(started!.payload.ts as number);
+  });
+});
+
+// ── Hunt memory integration (default ON, opt out via ZERO_DISABLE_HUNT_MEMORY) ──
+
+describe("runNativeAgentLoop — Memory", () => {
+  let home: string;
+  beforeEach(() => {
+    delete process.env["ZERO_DISABLE_HUNT_MEMORY"]; delete process.env["ZERO_DISABLE_MEMORY"];
+    home = mkdtempSync(join(tmpdir(), "0-memory-"));
+    vi.stubEnv("HOME", home);
+  });
+  afterEach(() => { vi.unstubAllEnvs(); rmSync(home, { recursive: true, force: true }); });
+  const cfg = (extra: Partial<NativeAgentConfig> = {}): NativeAgentConfig => ({ role: "review", codebaseLearning: true, scopePath: home, target: home, scanId: "memory", systemPrompt: "Review", tools: [], maxTurns: 2, ...extra });
+
+  it("shows folder notes at loop start and lets the model remember one", async () => {
+    const store = createFileNoteStore({ home });
+    store.add({ text: "Routes live in module.ts", folder: home });
+    let first = true; const seen: string[] = []; let tools: string[] = [];
+    const runtime: NativeRuntime = {
+      type: "api", isAvailable: async () => true,
+      executeNative: async (_system, messages, offered) => {
+        seen.push(JSON.stringify(messages)); tools = offered.map((tool) => tool.name);
+        if (!first) return { content: [{ type: "text", text: "done" }], stopReason: "end_turn", durationMs: 1 };
+        first = false;
+        return { content: [{ type: "tool_use", id: "m", name: "memory", input: { action: "remember", note: "Tests run with pnpm test", kind: "command" } }], stopReason: "tool_use", durationMs: 1 };
+      },
+    };
+    await runNativeAgentLoop({ config: cfg(), runtime, db: null, memoryStore: store });
+    expect(seen[0]).toContain("Routes live in module.ts"); expect(seen[0]).toContain("untrusted");
+    expect(tools).toContain("memory");
+    // A scan loop reads repository content all the time, so it cannot add notes.
+    expect(store.list({ folder: home }).map((note) => note.text)).toEqual(["Routes live in module.ts"]);
+  });
+
+  it("stays cold for verify, when the run opts out, and when the environment vetoes it", async () => {
+    const store = createFileNoteStore({ home });
+    store.add({ text: "Private routing context", folder: home });
+    const run = async (config: NativeAgentConfig, extra: { memoryStore?: typeof store } = { memoryStore: store }) => {
+      const seen: string[] = []; const names: string[] = [];
+      const runtime: NativeRuntime = { type: "api", isAvailable: async () => true, executeNative: async (_s, messages, tools) => { seen.push(JSON.stringify(messages)); names.push(...tools.map((tool) => tool.name)); return { content: [{ type: "text", text: "done" }], stopReason: "end_turn", durationMs: 1 }; } };
+      await runNativeAgentLoop({ config, runtime, db: null, ...extra });
+      return { text: seen.join(""), names };
+    };
+    for (const result of [await run(cfg({ role: "verify" })), await run(cfg({ codebaseLearning: false, role: "review" }))]) {
+      expect(result.text).not.toContain("Private routing context"); expect(result.names).not.toContain("memory");
+    }
+    process.env["ZERO_DISABLE_MEMORY"] = "1";
+    const vetoed = await run(cfg());
+    expect(vetoed.text).not.toContain("Private routing context"); expect(vetoed.names).not.toContain("memory");
+  });
+});
+
+describe("runNativeAgentLoop — coordinator rails enforcement", () => {
+  beforeEach(() => {
+    // Rails are default OFF (opt-in) so they never surface as transcript noise
+    // unless enabled; enable them explicitly to exercise the enforcement path.
+    process.env["ZERO_FEATURE_COORDINATOR_RAILS"] = "1";
+  });
+  afterEach(() => {
+    delete process.env["ZERO_FEATURE_COORDINATOR_RAILS"];
+  });
+
+  it("nudges a spinning subagent when enabled via a coordinator_action event", async () => {
+    const events: Array<[string, Record<string, unknown>]> = [];
+    let turn = 0;
+    const runtime: NativeRuntime = {
+      type: "api" as const,
+      async executeNative() {
+        turn++;
+        if (turn === 1) {
+          // A child that re-issues the SAME call repeatedly (a spin).
+          eventBus.emit("subagent_lifecycle", {
+            agent_id: "loopy-sub-1",
+            status: "running",
+            max_turns: 50,
+          });
+          for (let i = 0; i < 4; i++) {
+            eventBus.emit("subagent_progress", {
+              agent_id: "loopy-sub-1",
+              tool: "http_request",
+              note: "same",
+              turn: i + 1,
+              max_turns: 50,
+            });
+          }
+          return {
+            content: [{ type: "tool_use", id: "r1", name: "bash", input: { command: "true" } }],
+            stopReason: "tool_use",
+            durationMs: 1,
+          };
+        }
+        return {
+          content: [{ type: "text", text: "ok" }],
+          stopReason: "end_turn",
+          durationMs: 1,
+        };
+      },
+      async isAvailable() {
+        return true;
+      },
+    };
+
+    const state = await runNativeAgentLoop({
+      config: {
+        role: "attack",
+        systemPrompt: "t",
+        tools: [],
+        maxTurns: 50,
+        target: "https://x.example.com",
+        scanId: "loopy",
+      },
+      runtime,
+      db: null,
+      onEvent: (t, p) => events.push([t, p]),
+    });
+
+    const action = events.find(
+      ([t, p]) =>
+        t === "coordinator_action" &&
+        (p.intervention === "nudge" || p.intervention === "force-pivot"),
+    );
+    expect(action).toBeDefined();
+    // No messaging runtime wired → the nudge is surfaced via the event channel.
+    expect(action![1].enforcement).toBe("nudge-event");
+    expect(state.done).toBe(true);
+  });
+
+  it("escalates a stalled subagent holding findings (kill downgraded) and preserves findings", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    try {
+      const events: Array<[string, Record<string, unknown>]> = [];
+      let turn = 0;
+      const runtime: NativeRuntime = {
+        type: "api" as const,
+        async executeNative() {
+          turn++;
+          if (turn === 1) {
+            // Parent saves its own finding — must survive any supervision.
+            return {
+              content: [
+                {
+                  type: "tool_use",
+                  id: "f1",
+                  name: "finding",
+                  input: {
+                    title: "Parent XSS",
+                    severity: "high",
+                    category: "xss",
+                    evidence_request: "GET /",
+                    evidence_response: "resp",
+                  },
+                },
+              ],
+              stopReason: "tool_use",
+              durationMs: 1,
+            };
+          }
+          if (turn === 2) {
+            // A running child that already saved a finding, then goes silent.
+            eventBus.emit("subagent_lifecycle", {
+              agent_id: "stall-sub-1",
+              status: "running",
+              max_turns: 100,
+              findings: 1,
+            });
+            // Jump the clock past the escalate threshold (>180s, <420s kill).
+            vi.setSystemTime(200_000);
+            return {
+              content: [{ type: "tool_use", id: "w1", name: "bash", input: { command: "true" } }],
+              stopReason: "tool_use",
+              durationMs: 1,
+            };
+          }
+          return {
+            content: [{ type: "text", text: "ok" }],
+            stopReason: "end_turn",
+            durationMs: 1,
+          };
+        },
+        async isAvailable() {
+          return true;
+        },
+      };
+
+      const state = await runNativeAgentLoop({
+        config: {
+          role: "attack",
+          systemPrompt: "t",
+          tools: [],
+          maxTurns: 100,
+          target: "https://y.example.com",
+          scanId: "stall",
+        },
+        runtime,
+        db: null,
+        onEvent: (t, p) => events.push([t, p]),
+      });
+
+      // Findings are NEVER dropped by supervision.
+      expect(state.findings.map((f) => f.title)).toContain("Parent XSS");
+
+      // The provably-dead kill path is downgraded to an operator escalation
+      // (no per-agent cancellation is wired to a spawned subagent).
+      const esc = events.find(
+        ([t, p]) =>
+          t === "coordinator_action" &&
+          p.kind === "kill-escalate" &&
+          p.enforcement === "escalate-to-operator",
+      );
+      expect(esc).toBeDefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+// ── toolFailureText: never a bare "unknown" ──
+
+describe("toolFailureText", () => {
+  it("prefers the real error message", () => {
+    expect(toolFailureText("http_request", { success: false, output: null, error: "url is required" }))
+      .toBe("url is required");
+  });
+
+  it("folds an exit-code + output tail from the display sidecar into the reason", () => {
+    const text = toolFailureText("run_command", {
+      success: false,
+      output: null,
+      error: "command failed",
+      meta: { kind: "command", exitCode: 1, stdout: "configure: error: no C compiler found" },
+    });
+    expect(text).toContain("command failed");
+    expect(text).toContain("exited 1");
+    expect(text).toContain("no C compiler found");
+  });
+
+  it("uses the exit summary alone when the error string is blank", () => {
+    const text = toolFailureText("run_command", {
+      success: false,
+      output: null,
+      error: "",
+      meta: { kind: "command", exitCode: 127, stdout: "sh: gcc: not found" },
+    });
+    expect(text).toContain("exited 127");
+    expect(text).toContain("gcc: not found");
+  });
+
+  it("reports a timeout with the ceiling when timed out", () => {
+    const text = toolFailureText("run_command", {
+      success: false,
+      output: null,
+      meta: { kind: "command", exitCode: null, timedOut: true, timeoutMs: 30000 },
+    });
+    expect(text).toContain("timed out after 30000ms");
+  });
+
+  it("falls back to a NAMED generic string when there is truly nothing — never bare 'unknown'", () => {
+    const text = toolFailureText("some_tool", { success: false, output: null });
+    expect(text).toBe("some_tool failed without an error message");
+    expect(text).not.toBe("unknown");
+  });
+
+  it("does not duplicate an exit summary already present in the error", () => {
+    const text = toolFailureText("run_command", {
+      success: false,
+      output: null,
+      error: "exited 2: boom",
+      meta: { kind: "command", exitCode: 2, stdout: "boom" },
+    });
+    expect(text.match(/exited 2/g)).toHaveLength(1);
+  });
+});
+
+describe("recursive subagents", () => {
+  it("returns a grandchild's finding once, charges shared usage, and keeps the tool list bounded", async () => {
+    const home = mkdtempSync(join(tmpdir(), "0-recursive-review-"));
+    const source = join(home, "route.ts");
+    writeFileSync(source, "export const authorize = false;\n");
+    vi.stubEnv("HOME", home);
+    const ledger = new ScanCostLedger();
+    const edges: Array<{ agent_id: string; parent_scan_id: string }> = [];
+    const unsubscribe = eventBus.subscribe({ emit(type, payload) {
+      if (type === "subagent_lifecycle" && payload.status === "running") edges.push(payload);
+    } });
+    const captured: { system?: string; messages: NativeMessage[] } = { messages: [] };
+    const runtimeAt = (depth: number): NativeRuntime => {
+      let turn = 0;
+      return {
+        type: "api",
+        isAvailable: async () => true,
+        forkForSubagent: async () => runtimeAt(depth + 1),
+        executeNative: async (system, messages) => {
+          turn++;
+          if (depth === 2 && turn === 2) {
+            captured.system = system;
+            captured.messages.push(...messages);
+          }
+          return {
+            content: turn > 1 ? [{ type: "text", text: "Evidence inspection complete." }] :
+              depth === 0 ? [{ type: "tool_use", id: "delegate-0", name: "spawn_agent", input: { task: "PARENT_TASK: Examine file structure", max_turns: 2 } }] :
+              depth === 1 ? [{ type: "tool_use", id: "delegate-1", name: "spawn_agent", input: { task: "CHILD_TASK: Inspect route.ts", max_turns: 2 } }] : [
+                { type: "tool_use", id: "read", name: "read_file", input: { path: "route.ts" } },
+                { type: "tool_use", id: "restricted", name: "query_findings", input: {} },
+                { type: "tool_use", id: "finding", name: "finding", input: {
+                  title: "Authorization disabled", description: "route.ts exports a disabled authorization guard.",
+                  category: "broken-access-control", severity: "high", source_path: "route.ts", source_start_line: 1,
+                  evidence_request: "route.ts:1", evidence_response: "export const authorize = false;",
+                } },
+              ],
+            stopReason: turn > 1 ? "end_turn" : "tool_use",
+            durationMs: 0, usage: { inputTokens: 10, outputTokens: 1 },
+          };
+        },
+      };
+    };
+    try {
+      const state = await runNativeAgentLoop({
+        config: {
+          role: "review", systemPrompt: "ROOT_POLICY: Review without modifications.", target: home,
+          scopePath: home, workspaceRoot: home, scanId: "recursive-root", maxTurns: 2,
+          tools: getToolsForRole().filter(tool => tool.name !== "query_findings"),
+          costLedger: ledger,
+          codebaseLearning: false,
+        },
+        runtime: runtimeAt(0), db: null,
+      });
+      expect(state.findings.map(finding => finding.title)).toEqual(["Authorization disabled"]);
+      expect(readFileSync(source, "utf8")).toBe("export const authorize = false;\n");
+      expect(captured.messages.flatMap(message => message.content)).toContainEqual(
+        expect.objectContaining({ type: "tool_result", tool_use_id: "restricted", is_error: true }),
+      );
+      expect(captured.system).toContain("ROOT_POLICY: Review without modifications.");
+      expect(captured.system).toContain("CHILD_TASK: Inspect route.ts");
+      expect(captured.system).not.toContain("PARENT_TASK: Examine file structure");
+      expect(edges).toHaveLength(2);
+      expect(edges[0].parent_scan_id).toBe("recursive-root");
+      expect(edges[1].parent_scan_id).toBe(edges[0].agent_id);
+      expect(ledger.tokenUsage()).toMatchObject({ inputTokens: 60, outputTokens: 6 });
+    } finally {
+      unsubscribe();
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("stops a running recursive subtree only after descendant execution drains", async () => {
+    const home = mkdtempSync(join(tmpdir(), "0-recursive-stop-"));
+    vi.stubEnv("HOME", home);
+    const { promise: running, resolve: started } = Promise.withResolvers<void>();
+    const { promise: cleanup, resolve: release } = Promise.withResolvers<void>();
+    const { promise: interrupted, resolve: interrupt } = Promise.withResolvers<void>();
+    let descendantDrained = false;
+    const runtimeAt = (depth: number): NativeRuntime => ({
+      type: "api",
+      isAvailable: async () => true,
+      forkForSubagent: async () => runtimeAt(depth + 1),
+      executeNative: async (_system, _messages, _tools, _callbacks, signal) => {
+        if (depth === 1) return {
+          content: [{ type: "tool_use", id: "delegate", name: "spawn_agent", input: { task: "Wait for cancellation", max_turns: 1 } }],
+          stopReason: "tool_use", durationMs: 0,
+        };
+        started();
+        if (signal?.aborted) interrupt();
+        else signal!.addEventListener("abort", () => interrupt(), { once: true });
+        await interrupted;
+        await cleanup;
+        descendantDrained = true;
+        throw signal!.reason;
+      },
+    });
+    const executor = new ToolExecutor({
+      role: "review", target: home, scopePath: home, scanId: "recursive-stop",
+      findings: [], attackResults: [], targetInfo: {},
+    }, null, undefined, async () => runtimeAt(1));
+    const task = executor.execute({ name: "spawn_agent", arguments: { task: "Delegate bounded work", max_turns: 1 } });
+    try {
+      await running;
+      let stopped = false;
+      const stop = executor.stopPersistentAgents().then(() => { stopped = true; });
+      await interrupted;
+      expect(stopped).toBe(false);
+      expect(descendantDrained).toBe(false);
+      release();
+      await stop;
+      expect(descendantDrained).toBe(true);
+      expect((await task).success).toBe(false);
+    } finally {
+      release();
+      await task;
+      await executor.cleanup();
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("optional native turn allowance", () => {
+  const config = { role: "audit" as const, systemPrompt: "Review source", tools: [], target: "https://example.test", scanId: "uncapped-test" };
+  const finish: NativeRuntimeResult = { content: [{ type: "text", text: "Review complete" }], stopReason: "end_turn", durationMs: 0 };
+
+  it("runs past historical defaults without countdown prompts", async () => {
+    let calls = 0;
+    const prompts: string[] = [];
+    const runtime = createMockRuntime([finish]);
+    runtime.executeNative = async (_system, messages) => {
+      prompts.push(JSON.stringify(messages));
+      calls++;
+      return calls > 125 ? finish : { content: [{ type: "tool_use", id: `todo-${calls}`, name: "update_todos", input: { todos: [{ content: `Inspect section ${calls}`, status: "in_progress" }] } }], stopReason: "tool_use", durationMs: 0 };
+    };
+    const state = await runNativeAgentLoop({ config, runtime, db: null });
+    expect(state.done).toBe(true);
+    expect(calls).toBe(126);
+    expect(prompts.join("\n")).not.toMatch(/turns left|turns remaining|FINAL PUSH|HALFWAY|\[0 budget\]/);
+  });
+
+  it("continues more than three output checkpoints when uncapped", async () => {
+    const checkpoint: NativeRuntimeResult = { content: [{ type: "text", text: "Retained observation" }], stopReason: "max_tokens", checkpoint: { reason: "max_output_tokens", discardedToolCalls: 0 }, usage: { inputTokens: 1, outputTokens: 1 }, durationMs: 0 };
+    const state = await runNativeAgentLoop({ config, runtime: createMockRuntime([...Array.from({ length: 5 }, () => checkpoint), finish]), db: null });
+    expect(state.done).toBe(true);
+    expect(state.outputCapExit).toBeUndefined();
+    expect(state.turnCount).toBe(6);
+  });
+
+  it("honors cancellation without an implicit limit", async () => {
+    const controller = new AbortController();
+    const runtime = createMockRuntime([finish]);
+    runtime.executeNative = async () => { controller.abort(); return finish; };
+    const state = await runNativeAgentLoop({ config, runtime, db: null, signal: controller.signal });
+    expect(state.done).toBe(false);
+    expect(state.summary).toContain("cancelled");
+  });
+
+  it.each([0, -1, 1.5, Infinity, NaN])("rejects invalid explicit budget %s", async maxTurns => {
+    await expect(runNativeAgentLoop({ config: { ...config, maxTurns }, runtime: createMockRuntime([finish]), db: null })).rejects.toThrow("finite positive safe integer");
+  });
+
+  it("honors a pending user steer before accepting completion", async () => {
+    let polls = 0;
+    let calls = 0;
+    const runtime = createMockRuntime([finish]);
+    runtime.executeNative = async () => { calls++; return finish; };
+    const state = await runNativeAgentLoop({ config, runtime, db: null,
+      getPendingUserMessages: () => ++polls === 2 ? ["Check the remaining source path"] : [] });
+    expect(state.done).toBe(true);
+    expect(calls).toBe(2);
+    expect(state.messages.some(message => JSON.stringify(message).includes("Check the remaining source path"))).toBe(true);
+  });
+
+  it("preserves an explicit allowance", async () => {
+    const response: NativeRuntimeResult = { content: [{ type: "tool_use", id: "todo", name: "update_todos", input: { todos: [{ content: "Inspect", status: "in_progress" }] } }], stopReason: "tool_use", durationMs: 0 };
+    const state = await runNativeAgentLoop({ config: { ...config, maxTurns: 2 }, runtime: createMockRuntime([response]), db: null });
+    expect(state.turnCount).toBe(2);
+    expect(state.done).toBe(false);
+    expect(state.summary).toContain("max turns (2)");
+  });
+});

@@ -1,0 +1,105 @@
+import { type ConsoleRuntime,  CodexCatalogRefreshError, createConsoleRuntime, type CodexCatalogModel, type RuntimeConfig } from "@0/engine";
+import { getSiwcConnection } from "./chatgpt-plan-store.js";
+import { getSettings, updateSetting } from "./settings-store.js";
+import type { ModelPreference } from "./settings.js";
+
+async function createSelectedRuntime(config: Partial<RuntimeConfig>, allowChatGptPlan = true): Promise<ConsoleRuntime> {
+  if (config.provider !== "chatgpt-plan") return createConsoleRuntime(config);
+  if (!allowChatGptPlan) throw new Error("Native ChatGPT plan sign-in is available only in a user-controlled local open-source runtime. Use an API key for hosted or shared workspaces.");
+  const connection = config.siwcConnection ?? getSiwcConnection(config.env?.HOME);
+  if (config.model) return createConsoleRuntime({ ...config, siwcConnection: connection });
+  const probe = createConsoleRuntime({ ...config, model: "probe", siwcConnection: connection });
+  const catalog = await probe.availableModelCatalog(AbortSignal.timeout(10_000));
+  if (!catalog.length) throw new Error("This ChatGPT connection returned no models. Check plan sharing in ChatGPT Settings.");
+  probe.reconfigure({ model: catalog[0]!.id }); return probe;
+}
+
+/** Restore only a choice applied to this exact connection; never infer model access from its name. */
+export async function createPreferredConsoleRuntime(
+  config: Partial<RuntimeConfig>,
+  options: { allowChatGptPlan?: boolean; inheritedConnectionIdentity?: string; onDiscoveryError?: (error: unknown) => void; cyberAccessProgram?: ModelPreference["cyberAccessProgram"] | null } = {},
+): Promise<{ runtime: ConsoleRuntime; explicitChoice: boolean }> {
+  const env = config.env ?? process.env;
+  const envModel = env["ZERO_MODEL"]?.trim();
+  const envProvider = env["ZERO_SELECTED_PROVIDER"]?.trim() || env["ZERO_PROVIDER"]?.trim() || env["ZERO_FORCE_PROVIDER"]?.trim();
+  const inherited = options.inheritedConnectionIdentity !== undefined;
+  // A provider pin chooses a connection; only an explicit model pins its selection.
+  const explicitChoice = (!inherited && config.model !== undefined) || Boolean(envModel);
+  if (inherited && (envModel || envProvider)) config = { ...config, model: undefined, provider: undefined };
+  if (config.provider === undefined && envProvider) config = { ...config, provider: envProvider as RuntimeConfig["provider"] };
+  let runtime: ConsoleRuntime | undefined;
+  let retainedModel = false;
+  let retainedProgram: ModelPreference["cyberAccessProgram"];
+
+  if (inherited && !envModel && !envProvider) {
+    runtime = await createSelectedRuntime({ ...config, model: undefined }, options.allowChatGptPlan);
+    if (runtime.connectionIdentity() === options.inheritedConnectionIdentity) {
+      runtime.reconfigure({ model: config.model });
+      retainedModel = config.model !== undefined;
+    }
+  }
+  if (!explicitChoice && !retainedModel) {
+    const saved = getSettings().modelPreference;
+    if (saved && (config.provider === undefined || config.provider === saved.providerId)) {
+      try {
+        const candidate = await createSelectedRuntime({ ...config, model: saved.model, provider: saved.providerId as RuntimeConfig["provider"] }, options.allowChatGptPlan);
+        if (candidate.connectionIdentity() === saved.connectionIdentity) {
+          if (options.cyberAccessProgram === undefined) retainedProgram = saved.cyberAccessProgram;
+          runtime = candidate;
+          retainedModel = true;
+        }
+      } catch {
+        // A disconnected saved provider cannot redirect another account's runtime.
+      }
+    }
+  }
+  runtime ??= await createSelectedRuntime(config, options.allowChatGptPlan);
+  if (!explicitChoice && runtime.getConfigurationDiagnostics().provider === "chatgpt-codex") {
+    let catalog: readonly CodexCatalogModel[] | undefined;
+    try {
+      catalog = await runtime.codexModelCatalog(AbortSignal.timeout(10_000));
+    } catch (error) {
+      options.onDiscoveryError?.(error);
+      if (error instanceof CodexCatalogRefreshError) catalog = error.cachedModels;
+      // With no applied choice or account catalog, the runtime's historical
+      // hardcoded model is not evidence that this account can use it.
+      else if (!retainedModel) throw error;
+    }
+    if (catalog) {
+      if (!catalog.length) throw new Error("This ChatGPT subscription returned no available models.");
+      const currentModel = runtime.resolvedModel();
+      // The loader orders account rows by backend recommendation, not model-name guesses.
+      if (!retainedModel || !catalog.some((model) => model.id === currentModel)) {
+        runtime.reconfigure({ model: catalog[0]!.id });
+      }
+    }
+  }
+  if (retainedProgram !== undefined) runtime.setCyberAccessProgram(retainedProgram);
+  if (options.cyberAccessProgram !== undefined) runtime.setCyberAccessProgram(options.cyberAccessProgram);
+  return { runtime, explicitChoice };
+}
+
+/** Call only after an explicit choice was successfully applied, never while staging it. */
+export function saveAppliedModelPreference(runtime: ConsoleRuntime): boolean {
+  const connectionIdentity = runtime.connectionIdentity();
+  if (!connectionIdentity) return false;
+  const preference: ModelPreference = {
+    providerId: runtime.getConfigurationDiagnostics().provider,
+    model: runtime.resolvedModel(),
+    connectionIdentity,
+    ...(runtime.getCyberAccessProgram() !== undefined ? { cyberAccessProgram: runtime.getCyberAccessProgram() } : {}),
+  };
+  return updateSetting("modelPreference", preference, { scope: "global" });
+}
+
+/**
+ * A cyber access program picked inside a live mission: keep the saved default model and only update its program.
+ * With no saved default yet, the mission's model seeds it, as before.
+ */
+export function saveAppliedAccessProgram(runtime: ConsoleRuntime): boolean {
+  const saved = getSettings().modelPreference;
+  if (!saved) return saveAppliedModelPreference(runtime);
+  const program = runtime.getCyberAccessProgram();
+  const { cyberAccessProgram: _previous, ...rest } = saved;
+  return updateSetting("modelPreference", { ...rest, ...(program !== undefined ? { cyberAccessProgram: program } : {}) }, { scope: "global" });
+}

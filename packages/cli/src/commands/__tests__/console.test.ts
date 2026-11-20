@@ -1,0 +1,193 @@
+import type * as Core from "@0/engine";
+import { Command } from "commander";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+import {
+  resolveConsoleAutonomyMode,
+  registerConsoleCommand,
+} from "../console.js";
+
+const startup = vi.hoisted(() => ({
+  bun: true,
+  interactive: true,
+  showConsole: vi.fn(),
+  createSession: vi.fn(),
+  stdout: vi.fn(),
+  stderr: vi.fn(),
+}));
+
+vi.mock("../../console-session.js", () => ({ createLocalConsoleSession: startup.createSession }));
+vi.mock("../../presentation/process-output.js", () => ({
+  processPresentationOutput: { stdout: startup.stdout, stderr: startup.stderr },
+}));
+
+vi.mock("../../state/runtime.js", () => ({
+  isBunRuntime: () => startup.bun,
+  canUseOpenTui: () => startup.interactive,
+}));
+vi.mock("../../state/run.js", () => ({
+  showOpenTuiConsole: startup.showConsole,
+  showOpenTuiResume: vi.fn(),
+}));
+vi.mock("@0/engine", async (importOriginal) => {
+  const actual = await importOriginal<typeof Core>();
+  return {
+    ...actual,
+    connectMcpServers: async () => undefined,
+  };
+});
+
+describe("console launch authorization", () => {
+  let previousExitCode: typeof process.exitCode;
+
+  beforeEach(() => {
+    previousExitCode = process.exitCode;
+    process.exitCode = undefined;
+    startup.bun = true;
+    startup.interactive = true;
+    startup.showConsole.mockReset();
+    vi.spyOn(console, "error").mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    process.exitCode = previousExitCode;
+    vi.restoreAllMocks();
+  });
+
+  async function launch(args: string[] = []) {
+    const program = new Command();
+    registerConsoleCommand(program);
+    await program.parseAsync(["console", ...args], { from: "user" });
+  }
+
+  it("directs interactive console users to the account-free browser", async () => {
+    const notice = vi.spyOn(console, "error").mockImplementation(() => {});
+    await launch();
+    expect(notice).toHaveBeenCalledWith(expect.stringContaining("To open the console, run 0 (no account required)"));
+    expect(startup.showConsole).not.toHaveBeenCalled();
+    expect(process.exitCode).toBe(2);
+    process.exitCode = undefined;
+    const program = new Command();
+    registerConsoleCommand(program);
+    await program.parseAsync(["console"], { from: "user" });
+    expect(startup.showConsole).not.toHaveBeenCalled();
+  });
+
+  it.each(["--prompt"])("rejects retired %s spelling instead of silently ignoring it", async flag => {
+    const program = new Command().exitOverride().configureOutput({ writeErr: () => {} });
+    registerConsoleCommand(program);
+    await expect(program.parseAsync(["console", flag, "value"], { from: "user" })).rejects.toMatchObject({ code: "commander.unknownOption" });
+  });
+});
+
+describe("headless console completion status", () => {
+  let previousExitCode: typeof process.exitCode;
+  beforeEach(async () => {
+    previousExitCode = process.exitCode;
+    process.exitCode = undefined;
+    startup.createSession.mockReset();
+    startup.stdout.mockReset();
+    startup.stderr.mockReset();
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    vi.spyOn(await import("@0/engine"), "createConsoleRuntime").mockReturnValue({
+      resolvedModel: () => "requested-model",
+    } as ReturnType<typeof Core.createConsoleRuntime>);
+  });
+  afterEach(() => {
+    process.exitCode = previousExitCode;
+    vi.restoreAllMocks();
+  });
+
+  it.each([
+    ["error", "console", "--print"], ["end_turn", "console", "--print"],
+  ] as const)("exits appropriately after a returned %s outcome via %s %s and cleans up", async (stopReason, command, promptFlag) => {
+    const error = "ChatGPT API error 400: requested model is not supported";
+    const send = vi.fn(async (_text: string, _callbacks?: unknown) => ({
+      stopReason, error: stopReason === "error" ? error : undefined,
+      assistantText: stopReason === "end_turn" ? "Completed evidence-backed answer." : "",
+      toolCalls: [], usage: { inputTokens: 12, outputTokens: 3 },
+    }));
+    const cleanup = vi.fn(async () => {});
+    startup.createSession.mockReturnValue({ send, cleanup });
+    const program = new Command();
+    registerConsoleCommand(program);
+    await program.parseAsync([command, "--approvals", "ask", "--model", "requested-model", promptFlag, "verify the selected target"], { from: "user" });
+
+    expect(send).toHaveBeenCalledOnce();
+    expect(send.mock.calls[0][0]).toBe("verify the selected target");
+    expect(cleanup).toHaveBeenCalledOnce();
+    expect(process.exitCode).toBe(stopReason === "error" ? 1 : undefined);
+    if (stopReason === "error") {
+      expect(startup.stderr).toHaveBeenCalledWith(expect.stringContaining(error), "console.turn.error");
+      expect(startup.stderr).toHaveBeenCalledWith(expect.stringContaining("No replacement model was selected"), "console.turn.model_unavailable");
+      expect(startup.createSession).toHaveBeenCalledOnce();
+    } else {
+      expect(startup.stderr).not.toHaveBeenCalled();
+      expect(startup.stdout).toHaveBeenCalledWith(expect.stringContaining("Completed evidence-backed answer."), "console.assistant.complete");
+      // stdout is the answer and nothing else: no prefix, no footer.
+      expect(startup.stdout.mock.calls.map(([text]) => text).join("")).toBe("Completed evidence-backed answer.");
+    }
+  });
+});
+
+describe("headless machine output", () => {
+  afterEach(() => { vi.restoreAllMocks(); });
+  it.each(["json", "ndjson"])("keeps %s stdout parseable and omits presentation output", async format => {
+    startup.stdout.mockReset(); startup.stderr.mockReset();
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    vi.spyOn(await import("@0/engine"), "createConsoleRuntime").mockReturnValue({ resolvedModel: () => "model" } as ReturnType<typeof Core.createConsoleRuntime>);
+    const outcome = { stopReason: "end_turn", assistantText: "Answer", toolCalls: [], usage: { inputTokens: 1, outputTokens: 1 } };
+    const cleanup = vi.fn(async () => {});
+    startup.createSession.mockReturnValue({ cleanup, send: vi.fn(async (_text, callbacks) => { callbacks.onAssistantDelta("Answer"); return outcome; }) });
+    const program = new Command(); registerConsoleCommand(program);
+    await program.parseAsync(["console", "--approvals", "ask", "--format", format, "--print", "Inspect"], { from: "user" });
+    const rows = stdout.mock.calls.map(([text]) => JSON.parse(String(text)));
+    expect(rows.map(row => row.type)).toEqual(format === "json" ? ["result"] : ["assistant-delta", "result"]);
+    expect(rows.at(-1).outcome).toEqual(outcome);
+    expect(startup.stdout).not.toHaveBeenCalled();
+    expect(cleanup).toHaveBeenCalledOnce();
+  });
+});
+
+describe("resolveConsoleAutonomyMode", () => {
+  const resolved = (approvals: "ask" | "auto") => ({ ok: true, approvals });
+
+  it("runs without asking when nothing is set", () => {
+    expect(resolveConsoleAutonomyMode({ settingApprovals: "auto" })).toEqual(resolved("auto"));
+    expect(resolveConsoleAutonomyMode({})).toEqual(resolved("auto"));
+  });
+
+  it("honours --approvals and the saved approvals setting, flags first", () => {
+    expect(resolveConsoleAutonomyMode({ approvals: "ask" })).toEqual(resolved("ask"));
+    expect(resolveConsoleAutonomyMode({ approvals: "auto" })).toEqual(resolved("auto"));
+    expect(resolveConsoleAutonomyMode({ settingApprovals: "ask" })).toEqual(resolved("ask"));
+    expect(resolveConsoleAutonomyMode({ approvals: "auto", settingApprovals: "ask" })).toEqual(resolved("auto"));
+  });
+
+  it("rejects an invalid --approvals", () => {
+    expect(resolveConsoleAutonomyMode({ approvals: "maybe" })).toMatchObject({ ok: false });
+  });
+});
+
+describe("retired access flags on console", () => {
+  afterEach(() => { vi.restoreAllMocks(); });
+  it.each([["--access", "read-only"], ["--mode", "recon"], ["--autonomy", "observe"], ["--tool-access", "read-only"], ["--yolo"]])("accepts %s and ignores it", async (...flag) => {
+    startup.stdout.mockReset(); startup.stderr.mockReset();
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    vi.spyOn(await import("@0/engine"), "createConsoleRuntime").mockReturnValue({ resolvedModel: () => "model" } as ReturnType<typeof Core.createConsoleRuntime>);
+    const send = vi.fn(async () => ({ stopReason: "end_turn", assistantText: "ok", toolCalls: [], usage: { inputTokens: 1, outputTokens: 1 } }));
+    startup.createSession.mockReturnValue({ cleanup: vi.fn(async () => {}), send });
+    const program = new Command(); registerConsoleCommand(program);
+    await program.parseAsync(["console", ...flag, "--approvals", "ask", "--format", "json", "--print", "Inspect"], { from: "user" });
+    expect(send).toHaveBeenCalledOnce();
+    expect(startup.createSession.mock.calls.at(-1)?.[0]).not.toHaveProperty("autonomyMode");
+  });
+  it("does not list them in help", () => {
+    const program = new Command(); registerConsoleCommand(program);
+    const help = program.commands.find(command => command.name() === "console")!.helpInformation();
+    for (const flag of ["--access", "--mode", "--autonomy", "--tool-access", "--yolo"]) expect(help).not.toMatch(new RegExp(`${flag}(?![\\w-])`));
+  });
+});

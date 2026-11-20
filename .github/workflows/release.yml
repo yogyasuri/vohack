@@ -1,0 +1,234 @@
+name: "0: Release"
+
+# Build the standalone `0` binary natively on each target OS and publish all
+# four (+ checksums) to the GitHub Release. Native builds avoid `bun --compile`
+# cross-compilation, so native parser assets are verified for each platform.
+# Each binary is smoke-tested on its own runner
+# before it ships. Desktop is development-only alpha and is never a release asset.
+#
+# Trigger: pushing a `v*` tag, or manually via workflow_dispatch with the tag.
+#
+# Pre-release gate: everything that is not a real release is a DRY RUN (build +
+# smoke every native binary, publish nothing). It runs automatically when a
+# branch push touches anything the standalone binary depends on (CLI version,
+# this workflow, bun-compile, the smoke scripts, the extension or command tree)
+# and nightly on main, so a broken binary shows up days before tag time.
+
+on:
+  push:
+    tags: ["v*"]
+    branches: ["**"]
+    paths:
+      - ".github/workflows/release.yml"
+      - "packages/cli/package.json"
+      - "packages/cli/src/index.ts"
+      - "packages/cli/src/commands/index.ts"
+      - "packages/cli/src/commands/skills*.ts"
+      - "scripts/bun-compile*"
+      - "scripts/smoke-standalone-binary.sh"
+      - "scripts/smoke-extension-runtime.mjs"
+      - "scripts/smoke-web-setup.mjs"
+      - "scripts/smoke-folder-access.mjs"
+      - "scripts/check-host-console-worker-bun.ts"
+      - "scripts/bundle-cli.mjs"
+  schedule:
+    - cron: "43 2 * * *"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Git tag or commit to build (e.g. v0.22.4)"
+        required: true
+      dry_run:
+        description: "Build and smoke every native binary without publishing"
+        type: boolean
+        default: false
+
+# Least privilege: jobs that publish say so themselves.
+permissions:
+  contents: read
+
+concurrency:
+  # A superseded dry run is worthless; a tag release must never be cancelled.
+  group: release-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+jobs:
+  main-gate:
+    name: Main is green on the exact tag commit
+    # The release gate. A tag (or a manual non-dry run) publishes nothing until
+    # the full `0: Main` run for THAT tag has concluded successfully on the tag's
+    # own commit. Main's push run on the branch does not count: tag runs are never
+    # path-skipped. Checked by scripts/check-workflow-triggers.mjs.
+    if: ${{ (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')) || (github.event_name == 'workflow_dispatch' && !inputs.dry_run) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 130
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Wait for a green Main run on this tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$' || { echo "::error::$TAG is not a release tag; releases publish from v<semver> tags only"; exit 1; }
+          sha="$(gh api "repos/$REPO/commits/$TAG" --jq .sha)"
+          echo "tag $TAG -> $sha"
+          for i in $(seq 1 120); do
+            runs="$(gh run list --repo "$REPO" --workflow main.yml --event push --branch "$TAG" --commit "$sha" --limit 20 --json status,conclusion,url)"
+            if [ "$(jq '[.[] | select(.status == "completed" and .conclusion == "success")] | length' <<<"$runs")" -gt 0 ]; then
+              echo "Main is green on $sha"; exit 0
+            fi
+            if [ "$(jq 'length' <<<"$runs")" -gt 0 ] && [ "$(jq '[.[] | select(.status != "completed")] | length' <<<"$runs")" -eq 0 ]; then
+              echo "::error::Main finished without success on $sha. Fix it or re-run Main, then re-run this workflow."
+              jq -r '.[].url' <<<"$runs"; exit 1
+            fi
+            echo "waiting for Main on $sha ($i/120)"; sleep 60
+          done
+          echo "::error::timed out waiting for Main on $sha"; exit 1
+
+  build:
+    name: build ${{ matrix.asset }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            asset: 0-darwin-arm64
+          - os: ubuntu-latest
+            asset: 0-linux-x64
+          - os: ubuntu-24.04-arm
+            asset: 0-linux-arm64
+          - os: windows-latest
+            asset: 0-windows-x64.exe
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
+      ZERO_BUILD_RELEASE_CHANNEL: ${{ ((github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')) || (github.event_name == 'workflow_dispatch' && !inputs.dry_run)) && 'beta' || 'dev' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          # The vendored native parser preserves its grammar ABI while building
+          # with the C++20 standard required by our supported Node 24 runtime.
+          node-version: 24
+          # Hosted runners do not expose pnpm until the next `corepack enable`
+          # step. Disable setup-node's pre-Corepack cache probe.
+          package-manager-cache: false
+      - run: corepack enable
+      # Keep the compiler pinned while the bundled OpenTUI/native-addon surface
+      # is validated. `bun-compile.sh` stages tree-sitter's runtime-discovered
+      # N-API addons so their direct requires are embedded in the executable.
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: "1.3.14"
+      - name: Install dependencies
+        # No --ignore-scripts: the native addon (tree-sitter) must build so the
+        # compiled binary has a .node to load at runtime (arm64 has no prebuilt).
+        run: pnpm install --frozen-lockfile
+      - name: Build CLI dependency closure and dashboard
+        # The compiled CLI embeds the Vite dashboard assets. The dashboard is
+        # not a CLI dependency, so build it explicitly before bun-compile
+        # generates the embedded asset manifest.
+        run: |
+          pnpm --filter "@0/cli..." build
+          pnpm --filter "@0/web..." build
+      - name: Compile native binary
+        shell: bash
+        env:
+          # Release-only. Empty when the secret is unset (treated as unprovisioned).
+          # A malformed value fails scripts/built-in-sentry-dsn.mjs before compiling.
+          ZERO_RELEASE_SENTRY_DSN: ${{ secrets.ZERO_RELEASE_SENTRY_DSN }}
+          # Release-only public PostHog ingestion key; same rules (unset = no analytics,
+          # malformed fails scripts/built-in-posthog-key.mjs before compiling).
+          ZERO_RELEASE_POSTHOG_KEY: ${{ secrets.ZERO_RELEASE_POSTHOG_KEY }}
+        run: bash scripts/bun-compile.sh "" "dist-bin/${{ matrix.asset }}"
+      - name: Smoke the binary
+        # Dashboard embed, host console worker, extension install and web setup.
+        # One script shared with `scripts/ci-local.sh --only standalone-smoke`.
+        shell: bash
+        run: bash scripts/smoke-standalone-binary.sh "dist-bin/${{ matrix.asset }}"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ matrix.asset }}
+          path: dist-bin/${{ matrix.asset }}
+          if-no-files-found: error
+          retention-days: 1
+
+  release:
+    name: publish release
+    needs: [build, main-gate]
+    if: ${{ (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')) || (github.event_name == 'workflow_dispatch' && !inputs.dry_run) }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: dist-bin
+          merge-multiple: true
+      # Keep an explicit CLI allowlist so unrelated workflow artifacts
+      # cannot enter the release.
+      - name: Generate CLI checksums
+        run: |
+          cd dist-bin
+          sha256sum 0-darwin-arm64 0-linux-x64 0-linux-arm64 0-windows-x64.exe > checksums.txt
+          cat checksums.txt
+      - name: Generate release notes from docs/CHANGELOG.md
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          gh repo clone "${{ github.repository }}" src -- --depth 1 --branch "$TAG"
+          node src/scripts/release-notes.mjs --version "${TAG#v}" --out release-notes.md
+      - name: Create / update the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          assets=(
+            dist-bin/0-darwin-arm64
+            dist-bin/0-linux-x64
+            dist-bin/0-linux-arm64
+            dist-bin/0-windows-x64.exe
+            dist-bin/checksums.txt
+          )
+          if gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release upload "$TAG" "${assets[@]}" --repo "${{ github.repository }}" --clobber
+          else
+            gh release create "$TAG" "${assets[@]}" \
+              --repo "${{ github.repository }}" \
+              --title "$TAG" \
+              --notes-file release-notes.md \
+              --verify-tag
+          fi
+
+  install-e2e:
+    name: ${{ matrix.method }} install (nightly)
+    # Verifies the public install commands in README.md and Getting Started
+    # against what is actually published, not a build-tree approximation. Runs
+    # nightly (it catches registry, GitHub Release and base-image drift) and on a
+    # manual dry run; it never runs on a tag, before the assets exist.
+    if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        method: [binary, source, container]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # These checks deliberately exercise the public default-branch surface.
+          ref: ${{ github.event.repository.default_branch }}
+      - name: Exercise documented ${{ matrix.method }} installation
+        run: bash scripts/install-e2e.sh ${{ matrix.method }}

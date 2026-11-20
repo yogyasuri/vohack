@@ -1,0 +1,34 @@
+---
+import Search from 'virtual:starlight/components/Search';
+import SiteTitle from 'virtual:starlight/components/SiteTitle';
+import ThemeSelect from 'virtual:starlight/components/ThemeSelect';
+import { getSections } from './sections';
+import GitHubLink from './GitHubLink.astro';
+import { DEMO_URL } from './links';
+
+const { sidebar } = Astro.locals.starlightRoute;
+const { sections, active, tabbed } = getSections(sidebar);
+const rest = (external: boolean) => (external ? { target: '_blank', rel: 'noopener' } : {});
+---
+
+<div class="docs-header">
+  <div class="docs-brand">
+    <SiteTitle />
+    <a class="docs-brand-label" href="/">Docs</a>
+  </div>
+  {tabbed && (
+    <nav class="docs-tabs" aria-label="Documentation sections">
+      {sections.map((section) => (
+        <a href={section.href} aria-current={section === active ? 'true' : undefined} {...rest(section.external)}>{section.label}</a>
+      ))}
+    </nav>
+  )}
+  <div class="docs-header-actions">
+    <div class="docs-header-search"><Search /></div>
+    <div class="docs-header-extra">
+      <GitHubLink />
+      <a class="docs-button docs-button--secondary docs-button--sm" href={DEMO_URL}>Book a demo</a>
+      <ThemeSelect />
+    </div>
+  </div>
+</div>

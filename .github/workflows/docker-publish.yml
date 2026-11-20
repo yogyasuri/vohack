@@ -1,0 +1,341 @@
+# Build + push the 0 engine image to ghcr.io/<owner>/0security.
+#
+# Trigger model (cost: an image build per main commit was the single largest
+# avoidable spend; main moves hundreds of commits a day):
+#
+#   - release  successful `0: Main` on a v<semver> TAG -> :<sha>, :X.Y.Z, :X.Y
+#              and :latest (only when X.Y.Z is the highest released version).
+#              `latest` therefore means "last release".
+#   - edge     nightly schedule, or manual dispatch -> :<sha> and :edge for the
+#              newest main commit whose Main run is green, only when that commit
+#              is not already the image behind :edge (dispatch `force` rebuilds).
+#
+# Every credentialed build still starts only after trusted CI succeeded for the
+# exact commit: release builds are chained from `0: Main` on the tag; edge builds
+# resolve the newest GREEN Main run on main. A tag push never runs source on the
+# publisher unless that same commit's Main passed and the tag matches package.json.
+on:
+  workflow_run:
+    workflows: ["0: Main"]
+    types: [completed]
+    branches: ["v*"]
+  schedule:
+    - cron: "11 1 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Rebuild :edge even if main has not changed since the last image"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  packages: write
+
+# Queue builds per ref; never cancel an in-progress build. Two failure
+# shapes this avoids (both measured 2026-07-17):
+#   - a condition-SKIPPED workflow_run publish (CI conclusion != success)
+#     occupied the group and CANCELLED a real in-progress build — skips
+#     must never kill builds;
+#   - out-of-order CI completions raced each other to GHCR. Queued
+#     builds complete in order instead of cancelling mid-flight.
+concurrency:
+  group: 0-docker-publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    name: plan (what to publish)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+      packages: read
+    outputs:
+      publish: ${{ steps.plan.outputs.publish }}
+      mode: ${{ steps.plan.outputs.mode }}
+      sha: ${{ steps.plan.outputs.sha }}
+      version: ${{ steps.plan.outputs.version }}
+      minor: ${{ steps.plan.outputs.minor }}
+      latest: ${{ steps.plan.outputs.latest }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Log in to GHCR
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Decide release, edge or nothing
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          RUN_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          RUN_EVENT: ${{ github.event.workflow_run.event }}
+          RUN_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          RUN_SHA: ${{ github.event.workflow_run.head_sha }}
+          RUN_REPO: ${{ github.event.workflow_run.head_repository.full_name }}
+          FORCE: ${{ inputs.force }}
+          REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          out() { printf '%s=%s\n' "$1" "$2" >> "$GITHUB_OUTPUT"; }
+          skip() { echo "Nothing to publish: $1"; out publish false; exit 0; }
+          OWNER="$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')"
+          IMAGE="ghcr.io/${OWNER}/0security"
+          if [ "$EVENT" = workflow_run ]; then
+            [ "$RUN_CONCLUSION" = success ] || skip "Main concluded $RUN_CONCLUSION"
+            [ "$RUN_EVENT" = push ] || skip "Main event was $RUN_EVENT"
+            [ "$RUN_REPO" = "$GITHUB_REPOSITORY" ] || skip "Main ran for a fork"
+            printf '%s' "$RUN_BRANCH" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$' || skip "$RUN_BRANCH is not a release tag"
+            VERSION="${RUN_BRANCH#v}"
+            TAG_SHA="$(git ls-remote origin "refs/tags/${RUN_BRANCH}^{}" "refs/tags/${RUN_BRANCH}" | tail -n1 | cut -f1)"
+            [ "$TAG_SHA" = "$RUN_SHA" ] || skip "tag $RUN_BRANCH does not point at the commit Main verified"
+            # :latest only moves for the highest released version.
+            HIGHEST="$(git ls-remote --tags origin 'refs/tags/v*' | grep -v '\^{}' | sed 's|.*refs/tags/v||' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n1)"
+            out publish true; out mode release; out sha "$RUN_SHA"
+            out version "$VERSION"; out minor "${VERSION%.*}"
+            if [ "$HIGHEST" = "$VERSION" ]; then out latest true; else out latest false; fi
+            exit 0
+          fi
+          # schedule / dispatch: edge from the newest green main commit.
+          [ "$REF" = refs/heads/main ] || skip "edge images are built from main only (ref is $REF)"
+          SHA="$(gh run list --workflow main.yml --branch main --event push --status success --limit 1 --json headSha --jq '.[0].headSha // empty')"
+          [ -n "$SHA" ] || skip "no green Main run on main"
+          CURRENT="$(docker buildx imagetools inspect "$IMAGE:edge" --format '{{json .Image}}' 2>/dev/null \
+            | jq -r '[.. | .Labels? | select(. != null) | .["org.opencontainers.image.revision"] // empty] | first // ""' 2>/dev/null || true)"
+          echo "newest green main: $SHA; image behind :edge: ${CURRENT:-none}"
+          if [ "$CURRENT" = "$SHA" ] && [ "$FORCE" != true ]; then skip ":edge already built from $SHA"; fi
+          out publish true; out mode edge; out sha "$SHA"; out version ""; out minor ""; out latest false
+
+  build-and-push:
+    needs: plan
+    if: needs.plan.outputs.publish == 'true'
+    # Isolate build/pull storage from the shared runner pool. Layers are reused
+    # through the scoped Actions cache below; amd64 requires no emulation.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      # Suppress build-record artifact upload — see the 0-side fix.
+      # docker/build-push-action v6 uploads a `.dockerbuild` record per
+      # build by default; those accumulated org-wide and exhausted the
+      # Actions artifact storage quota on 2026-07-28, which skipped this
+      # very workflow's publish job. We never consume these records.
+      DOCKER_BUILD_RECORD_UPLOAD: "false"
+      DOCKER_BUILD_SUMMARY: "false"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
+
+      - name: Set up Docker Buildx
+        id: buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve image name
+        id: image
+        run: |
+          set -euo pipefail
+          OWNER="$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')"
+          # 0security is the only image name; ghcr.io/<owner>/0 is no longer updated.
+          echo "name=ghcr.io/${OWNER}/0security" >> "$GITHUB_OUTPUT"
+
+      # The plan job already proved CI passed for this exact commit. Re-check
+      # that the checkout is that commit, and for a release that package.json
+      # carries the tagged version.
+      - name: Verify source
+        id: source
+        env:
+          SHA: ${{ needs.plan.outputs.sha }}
+          MODE: ${{ needs.plan.outputs.mode }}
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          set -euo pipefail
+          if [ "$(git rev-parse HEAD)" != "$SHA" ]; then
+            echo "::error::Checked-out source does not match the CI-verified commit."
+            exit 1
+          fi
+          if [ "$MODE" = release ] && [ "$(node -p "require('./package.json').version")" != "$VERSION" ]; then
+            echo "::error::package.json version does not match tag v$VERSION."
+            exit 1
+          fi
+          printf 'short_sha=%s\n' "${SHA:0:7}" >> "$GITHUB_OUTPUT"
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
+        with:
+          # workflow_run's default SHA can advance beyond the checked-out CI
+          # source. Pin both the immutable tag and revision to verified CI.
+          images: |
+            ${{ steps.image.outputs.name }}
+          # Tag plan:
+          #   - sha     (every build)                          abc1234
+          #   - edge    (nightly / dispatch, newest green main)
+          #   - release (v<semver> tag whose Main passed)      v0.31.0, 0.31.0, 0.31
+          #   - latest  (release only, highest version)        = last release
+          tags: |
+            type=raw,value=${{ steps.source.outputs.short_sha }}
+            type=raw,value=edge,enable=${{ needs.plan.outputs.mode == 'edge' }}
+            type=raw,value=v${{ needs.plan.outputs.version }},enable=${{ needs.plan.outputs.mode == 'release' }}
+            type=raw,value=${{ needs.plan.outputs.version }},enable=${{ needs.plan.outputs.mode == 'release' }}
+            type=raw,value=${{ needs.plan.outputs.minor }},enable=${{ needs.plan.outputs.mode == 'release' }}
+            type=raw,value=latest,enable=${{ needs.plan.outputs.mode == 'release' && needs.plan.outputs.latest == 'true' }}
+          labels: |
+            org.opencontainers.image.version=${{ needs.plan.outputs.version || steps.source.outputs.short_sha }}
+            org.opencontainers.image.revision=${{ needs.plan.outputs.sha }}
+            org.opencontainers.image.title=0
+            org.opencontainers.image.description=Security agents for your repositories.
+            org.opencontainers.image.source=https://github.com/0sec-labs/0security
+            org.opencontainers.image.licenses=MIT OR Apache-2.0
+          annotations: |
+            org.opencontainers.image.revision=${{ needs.plan.outputs.sha }}
+
+      - name: Refuse any tag outside ghcr.io/<owner>/0security
+        run: |
+          set -euo pipefail
+          # 0security is the only image name. A retired name must never be pushed
+          # again, whatever the tag plan or a stale ref produced.
+          while IFS= read -r tag; do
+            [ -z "$tag" ] && continue
+            case "$tag" in
+              ghcr.io/*/0security:*) ;;
+              *) echo "refusing to push $tag: only ghcr.io/<owner>/0security is published" >&2; exit 1 ;;
+            esac
+          done <<< "${{ steps.meta.outputs.tags }}"
+
+      - name: Build and push
+        id: build
+        # amd64-only: <REDACTED_INTERNAL_INFRA> + E2B sandboxes are all amd64, so the previous
+        # linux/arm64 leg was pure QEMU-emulated waste — 5-10x slower and the
+        # cause of the build failures (the emulated leg OOM/timeout). Dropping
+        # it fixes the build AND makes it much faster. One-shot retry mirrors
+        # worker-publish for the self-hosted runner's intermittent buildx
+        # graceful_stop/EOF failures.
+        continue-on-error: true
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        with:
+          context: .
+          file: ./scripts/docker/Dockerfile
+          platforms: linux/amd64
+          builder: ${{ steps.buildx.outputs.name }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=0
+          cache-to: type=gha,mode=max,scope=0
+          # Public ingestion keys embedded in the bundle, passed as BuildKit
+          # secrets so they stay out of layers, history and logs. This workflow
+          # never runs on pull_request, so PR/fork builds embed nothing.
+          secrets: |
+            zero_release_sentry_dsn=${{ secrets.ZERO_RELEASE_SENTRY_DSN }}
+            zero_release_posthog_key=${{ secrets.ZERO_RELEASE_POSTHOG_KEY }}
+          no-cache: ${{ github.event_name == 'workflow_dispatch' }}
+
+      - name: Re-authenticate to GHCR before retry
+        if: steps.build.outcome == 'failure'
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push — retry
+        id: build_retry
+        if: steps.build.outcome == 'failure'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        with:
+          context: .
+          file: ./scripts/docker/Dockerfile
+          platforms: linux/amd64
+          builder: ${{ steps.buildx.outputs.name }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=0
+          cache-to: type=gha,mode=max,scope=0
+          # Public ingestion keys embedded in the bundle, passed as BuildKit
+          # secrets so they stay out of layers, history and logs. This workflow
+          # never runs on pull_request, so PR/fork builds embed nothing.
+          secrets: |
+            zero_release_sentry_dsn=${{ secrets.ZERO_RELEASE_SENTRY_DSN }}
+            zero_release_posthog_key=${{ secrets.ZERO_RELEASE_POSTHOG_KEY }}
+          no-cache: true
+
+      # Buildx can refresh the registry session used for the push. Re-login
+      # before the daemon performs the independent digest pull below.
+      - name: Authenticate GHCR image smoke test
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Smoke-test published image
+        run: |
+          set -euo pipefail
+          # Smoke-test BY DIGEST, not by tag.
+          #
+          # This previously took `head -n1` of the metadata tag list on the
+          # assumption that the :sha tag is always first. It isn't: on the
+          # `workflow_run` path the list leads with `:main` (type=ref), and
+          # `:main` is not among the tags this trigger actually pushes — the
+          # push emits :sha and :latest. `docker pull` then hit a tag that
+          # does not exist, and GHCR answers "unauthorized" rather than 404
+          # for a private package, so the failure read as an auth problem for
+          # months of runs (e52a2e8, 2026-07-27) while the push underneath had
+          # succeeded perfectly.
+          #
+          # Use the successful attempt's immutable digest, including retries.
+          # It cannot drift from what was pushed, it cannot be
+          # reordered by a tag-plan change, and it is exactly the reference the
+          # release manifest pins — so this now smoke-tests the artifact we
+          # actually promote.
+          IMAGE="${{ steps.image.outputs.name }}@${{ steps.build_retry.outputs.digest || steps.build.outputs.digest }}"
+          echo "Smoke-testing $IMAGE"
+          docker pull "$IMAGE"
+          # Exec every tool as the non-root `ubuntu` user the image drops to.
+          # Any failure fails the job so broken tool additions can't silently
+          # ship — and, importantly, so the E2B template dispatch below never
+          # fires for an image whose tooling is broken.
+          docker run --rm --entrypoint bash "$IMAGE" -c '
+            set -e
+            echo "=== whoami ===" && whoami
+            echo "=== node ==="          && node --version
+            echo "=== ripgrep ==="       && rg --version | head -1
+            echo "=== nmap ==="          && nmap --version | head -1
+            echo "=== john ==="
+            john
+            # AD / cloud-identity tooling.
+            # `command -v` is the existence assertion (it exits non-zero when the
+            # binary is missing); the piped version banner is informational —
+            # piping would otherwise swallow a non-zero exit.
+            echo "=== ldapsearch ==="    && command -v ldapsearch && ldapsearch -VV 2>&1 | head -1
+            echo "=== klist ==="         && command -v klist && klist -V 2>&1 | head -1
+            echo "=== kinit ==="         && command -v kinit
+            for t in secretsdump.py GetUserSPNs.py GetNPUsers.py psexec.py wmiexec.py ntlmrelayx.py; do
+              echo "=== impacket $t ===" && command -v "$t" && "$t" -h 2>&1 | head -3
+            done
+            echo "=== certipy ==="        && command -v certipy && certipy --help 2>&1 | head -3
+            echo "=== bloodhound-ce ==="  && command -v bloodhound-ce-python && bloodhound-ce-python --help 2>&1 | head -3
+            echo "=== azurehound ==="     && command -v azurehound && azurehound --help 2>&1 | head -3
+            # FoxGuard — the default static scanner. `detectFoxguard()` in
+            # multi-modal.ts first finds it via `which`, then checks fallback
+            # paths; /usr/local/bin/foxguard must be on PATH.
+            echo "=== foxguard ==="       && command -v foxguard && foxguard --version 2>&1 | head -1
+            # The AD venv must NOT shadow the system interpreter: the agent
+            # helper scripts import the apt-managed requests/bs4 via plain
+            # `python3`, and a venv on PATH would silently hide them.
+            echo "=== system python deps ===" && python3 -c "import requests, bs4; print(\"py deps ok\")"
+            echo "ALL_TOOLS_OK"
+          '

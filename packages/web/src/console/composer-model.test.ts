@@ -1,0 +1,143 @@
+import { resolveStartChoice } from "./provider-health";
+import { describe, expect, it } from "vitest";
+import { SLASH_COMMANDS } from "@0/engine/shared/slash-commands";
+import {
+  CURATED_SLASH_COMMANDS,
+  groupSlashCommands,
+  curateSlashCommands,
+  effortChoices,
+  filterMentions,
+  fuzzyScore,
+  mentionToken,
+  boundModelStale,
+  modelButtonLabel,
+  orderMentions,
+  type MentionItem,
+} from "./composer-model";
+
+describe("slash curation", () => {
+  it("shows the curated eight in order and counts the rest", () => {
+    const { items, hidden } = curateSlashCommands(SLASH_COMMANDS, "", false);
+    expect(items.map((c) => c.name)).toEqual([...CURATED_SLASH_COMMANDS]);
+    expect(hidden).toBe(SLASH_COMMANDS.length - 8);
+  });
+  it("show all lists everything", () => {
+    const { items, hidden } = curateSlashCommands(SLASH_COMMANDS, "", true);
+    expect(items).toHaveLength(SLASH_COMMANDS.length);
+    expect(hidden).toBe(0);
+  });
+  it("a typed query searches every command, including aliases and verbs", () => {
+    const names = (query: string) => curateSlashCommands(SLASH_COMMANDS, query, false).items.map((c) => c.name);
+    expect(names("us")).toEqual(["models usage"]);
+    expect(names("new")).toEqual(["threads start"]);
+    expect(names("sessions")).toEqual(["threads list"]);
+    expect(names("threads ")).toEqual(["threads start", "threads list", "threads export", "threads close"]);
+    expect(names("models d")).toEqual(["models default"]);
+    expect(names("threads list extra")).toEqual([]);
+  });
+  it("groups consecutive commands under one heading", () => {
+    const groups = groupSlashCommands(curateSlashCommands(SLASH_COMMANDS, "threads ", false).items);
+    expect(groups.map((g) => g.group)).toEqual(["Threads"]);
+    expect(groupSlashCommands(SLASH_COMMANDS).map((g) => g.group)).toContain("Chat");
+  });
+});
+
+describe("mentions", () => {
+  const items: MentionItem[] = [
+    { kind: "finding", id: "f1", label: "Reflected XSS in search", token: "" },
+    { kind: "finding", id: "f2", label: "SQL injection", token: "" },
+    {
+      kind: "finding",
+      id: "f3",
+      label: "Open redirect (xss helper)",
+      token: "",
+    },
+  ];
+  it("fuzzy-matches subsequences and ranks prefixes first", () => {
+    expect(fuzzyScore("Reflected XSS", "rxss")).toBe(10);
+    expect(fuzzyScore("abc", "z")).toBeNull();
+    expect(filterMentions(items, "xss").map((i) => i.id)).toEqual(["f1", "f3"]);
+    expect(filterMentions(items, "sql").map((i) => i.id)).toEqual(["f2"]);
+  });
+  it("caps each group and keeps all items for an empty query", () => {
+    expect(filterMentions(items, "", 2)).toHaveLength(2);
+  });
+  it("orders plugins, findings, threads", () => {
+    const mk = (kind: MentionItem["kind"], id: string): MentionItem => ({
+      kind,
+      id,
+      label: id,
+      token: "",
+    });
+    expect(
+      orderMentions({
+        mission: [mk("mission", "m")],
+        plugin: [mk("plugin", "p")],
+        finding: [mk("finding", "f")],
+      }).map((i) => i.id),
+    ).toEqual(["p", "f", "m"]);
+  });
+  it("builds a reference token", () => {
+    expect(mentionToken("finding", "abc", ' A "quoted"\n title ')).toBe(`"A 'quoted' title" (finding abc) `);
+  });
+});
+
+describe("effort and model label", () => {
+  it("orders effort low to high and marks the selection", () => {
+    expect(effortChoices({ effort: "medium", options: ["high", "low", "medium"] })).toEqual([
+      { value: "low", label: "Low", selected: false },
+      { value: "medium", label: "Medium", selected: true },
+      { value: "high", label: "High", selected: false },
+    ]);
+  });
+  it("offers nothing when the model has no real choice", () => {
+    expect(effortChoices(null)).toEqual([]);
+    expect(effortChoices({ effort: "none", options: ["none"] })).toEqual([]);
+  });
+  it("falls back from runtime to remembered model to a prompt", () => {
+    expect(modelButtonLabel({ model: "a" }, { model: "b" })).toEqual({
+      text: "a",
+      known: true,
+    });
+    expect(modelButtonLabel(null, { model: "b" })).toEqual({
+      text: "b",
+      known: true,
+    });
+    expect(modelButtonLabel(null, undefined)).toEqual({
+      text: "Choose model",
+      known: false,
+    });
+    expect(modelButtonLabel(null, undefined, true)).toEqual({
+      text: "Default model",
+      known: false,
+    });
+  });
+});
+
+describe("boundModelStale", () => {
+  const models = [{ id: "m1", provider: "mock" }, { id: "off", provider: "mock", enabled: false }];
+  it("flags a bound model the catalog no longer lists, and waits for the catalog", () => {
+    expect(boundModelStale({ providerId: "xai", model: "gpt-xai-pro" }, models)).toBe(true);
+    expect(boundModelStale({ providerId: "xai", model: "gpt-xai-pro" }, [])).toBe(true);
+    expect(boundModelStale({ providerId: "mock", model: "off" }, models)).toBe(true);
+    expect(boundModelStale({ providerId: "xai", model: "gpt-xai-pro" }, undefined)).toBe(false);
+    expect(boundModelStale({ providerId: "mock", model: "m1" }, models)).toBe(false);
+    expect(boundModelStale(undefined, models)).toBe(false);
+    expect(boundModelStale({ providerId: "xai", model: "x", modelSource: "local" }, models)).toBe(false);
+  });
+  it("does not call a model gone while its provider's model list failed to load", () => {
+    const failed = new Set(["xai"]);
+    expect(boundModelStale({ providerId: "xai", model: "gpt-xai-pro" }, models, { discoveryFailed: failed })).toBe(false);
+    expect(boundModelStale({ providerId: "xai", model: "gpt-xai-pro" }, models, { discoveryFailed: new Set(["mock"]) })).toBe(true);
+  });
+  it("treats an unhealthy provider as stale only for an empty thread", () => {
+    const unusable = new Set(["mock"]);
+    expect(boundModelStale({ providerId: "mock", model: "m1" }, models, { unusable, emptyThread: true })).toBe(true);
+    expect(boundModelStale({ providerId: "mock", model: "m1" }, models, { unusable })).toBe(false);
+  });
+  it("re-resolves an empty draft to the healthy catalog choice", () => {
+    const choice = resolveStartChoice({ remembered: undefined, recommended: { providerId: "mock", model: "m1" } }, new Set());
+    expect(choice.choice).toEqual({ providerId: "mock", model: "m1" });
+    expect(modelButtonLabel(undefined, choice.choice)).toEqual({ text: "m1", known: true });
+  });
+});

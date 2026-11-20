@@ -1,0 +1,73 @@
+/** Browse model shared by Skills Browse and the skills library: plain summaries and category groups. */
+export type BrowsableSkill = { id: string; name: string; description: string; scope: string; summary?: string; category?: string; internal?: boolean };
+
+export const YOURS = "Your skills";
+const OTHER = "Other";
+const CATEGORY_ORDER = ["Web", "Injection", "Identity", "LLM", "Native & crypto", "Code review", "Supply chain", "Reporting", "Development"];
+const FALLBACK = "Reusable instructions for the agent.";
+const MAX_SUMMARY = 90;
+
+/** URL-safe category key, for `?category=` links. */
+export const categorySlug = (name: string) => name.toLowerCase().replace(/&/g, " ").replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+
+/**
+ * One plain line for people. Prefers the authored `summary`; otherwise cleans the model-facing
+ * description: drops "When to reach for ..." boilerplate and backticks, keeps the first sentence.
+ */
+export function cleanSkillSummary(skill: Pick<BrowsableSkill, "summary" | "description">): string {
+  const authored = skill.summary?.replace(/`/g, "").trim();
+  if (authored) return authored;
+  let text = (skill.description ?? "").replace(/\s+/g, " ").trim();
+  text = text.replace(/^when (?:to reach for|and how to use|to use|to call)\s+(?:the\s+)?(?:(?:offline|read-only)\s+)?(?:`[^`]*`|[\w-]+)\s*(?:engine|tool)?\s*[:,-]?\s*/i, "")
+    .replace(/^when\s+(?:an?|the)\s+/i, "");
+  text = text.replace(/`/g, "");
+  const sentence = text.match(/^(.+?[.!?])(?:\s|$)/)?.[1] ?? text;
+  let line = sentence.replace(/[.:;,\s]+$/, "").trim();
+  if (!line) return FALLBACK;
+  line = line[0]!.toUpperCase() + line.slice(1);
+  return line.length > MAX_SUMMARY ? `${line.slice(0, MAX_SUMMARY - 1).trimEnd()}…` : line;
+}
+
+export const isBundledSkill = (skill: Pick<BrowsableSkill, "scope">) => skill.scope === "builtin";
+
+/** Group name a skill is listed under. User skills share one group so they never mix into the bundled categories. */
+export const skillCategory = (skill: BrowsableSkill) => isBundledSkill(skill) ? skill.category?.trim() || OTHER : YOURS;
+
+const rank = (name: string) => name === YOURS ? -1 : name === OTHER ? 1000 : (CATEGORY_ORDER.indexOf(name) + 1 || 500);
+
+/** Every typed term must start a word in the text, so "race" does not match "trace". */
+export function matchesWords(text: string, query: string): boolean {
+  const terms = query.trim().toLowerCase().split(/\s+/).filter(Boolean);
+  const haystack = text.toLowerCase();
+  return terms.every(term => new RegExp(`(?:^|[^a-z0-9])${term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`).test(haystack));
+}
+
+export type SkillSection<T extends BrowsableSkill = BrowsableSkill> = { category: string; slug: string; skills: T[] };
+
+/** Visible skills grouped by category. Internal bundled skills are hidden; `category` is a slug or empty. */
+export function skillSections<T extends BrowsableSkill>(skills: readonly T[], query = "", category = ""): SkillSection<T>[] {
+  const needle = query.trim().toLowerCase();
+  const map = new Map<string, T[]>();
+  for (const skill of skills) {
+    if (skill.internal) continue;
+    const group = skillCategory(skill);
+    if (category && categorySlug(group) !== category) continue;
+    if (needle && !matchesWords(`${skill.name} ${cleanSkillSummary(skill)} ${group}`, needle)) continue;
+    map.set(group, [...(map.get(group) ?? []), skill]);
+  }
+  return [...map.entries()].sort((a, b) => rank(a[0]) - rank(b[0]) || a[0].localeCompare(b[0]))
+    .map(([name, list]) => ({ category: name, slug: categorySlug(name), skills: list.sort((a, b) => a.name.localeCompare(b.name)) }));
+}
+
+export const skillCategories = (skills: readonly BrowsableSkill[]) => skillSections(skills).map(({ category, slug }) => ({ value: slug, label: category }));
+
+/** Bundled and GitHub-added skills that the catalog already lists are shown once, by the catalog entry. */
+export function withoutCatalogDuplicates<T extends BrowsableSkill & { origin?: unknown }>(skills: readonly T[], catalogNames: ReadonlySet<string>): T[] {
+  return skills.filter(skill => !((isBundledSkill(skill) || skill.origin) && catalogNames.has(skill.name)));
+}
+
+/** Short label for where a skill comes from. An extension's skills show the extension's name. */
+export function skillSourceLabel(skill: Pick<BrowsableSkill, "scope"> & { source?: string }, shared: boolean): string {
+  if (skill.scope === "extension") return skill.source || "Extension";
+  return ({ builtin: "Included", workspace: shared ? "Team" : "Folder", personal: "Solo", project: "Folder", mounted: "Linked" } as Record<string, string>)[skill.scope] ?? "";
+}

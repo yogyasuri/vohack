@@ -1,0 +1,191 @@
+.console-dock-workspace {
+  --console-dock-menu-radius: var(--radius-menu);
+  --console-dock-control-radius: var(--radius-control);
+  position: relative;
+  isolation: isolate;
+  flex: 1;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  background: transparent;
+}
+
+.console-dock-workspace .dockview-theme-dark {
+  --dv-background-color: transparent;
+  --dv-group-view-background-color: transparent;
+  --dv-tabs-and-actions-container-background-color: transparent;
+  --dv-activegroup-visiblepanel-tab-background-color: var(--surface-selected);
+  --dv-activegroup-hiddenpanel-tab-background-color: var(--background);
+  --dv-inactivegroup-visiblepanel-tab-background-color: var(--surface-selected);
+  --dv-inactivegroup-hiddenpanel-tab-background-color: var(--background);
+  --dv-activegroup-visiblepanel-tab-color: var(--foreground);
+  --dv-activegroup-hiddenpanel-tab-color: var(--muted-foreground);
+  --dv-inactivegroup-visiblepanel-tab-color: var(--foreground);
+  --dv-inactivegroup-hiddenpanel-tab-color: var(--muted-foreground);
+  --dv-separator-border: var(--border-1);
+  --dv-tabs-and-actions-container-height: 44px;
+  --dv-tab-font-size: 12px;
+  --dv-drag-over-background-color: color-mix(in srgb, var(--primary) 12%, transparent);
+  --dv-drag-over-border-color: var(--primary);
+}
+
+/* The page already lives in one rounded panel; split groups sit flush and are divided by hairlines. */
+.console-dock-workspace .dv-grid-view.dv-dockview {
+  background: transparent;
+}
+
+.console-dock-workspace .dv-groupview {
+  background: transparent;
+}
+
+.console-dock-slot {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.console-dock-workspace .console-dock-slot {
+  --background: var(--workspace-panel);
+  background: transparent;
+}
+
+.console-dock-slot > section {
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* Dockview already aligns persistent overlays to the inset group rectangle. */
+.console-dock-workspace .dv-render-overlay {
+  padding: 0;
+  box-sizing: border-box;
+  overflow: hidden;
+  background: transparent;
+}
+
+.console-dock-workspace .console-dock-slot :is(video, canvas, iframe) {
+  border-radius: var(--console-dock-control-radius);
+}
+
+/* Capy-style strip: 44px, hairline underneath, pill tabs, ghost actions on the right. */
+.console-dock-workspace .dv-tabs-and-actions-container {
+  padding-inline: 8px;
+  border: 0;
+  border-bottom: 1px solid var(--border-1);
+  border-radius: 0;
+  background: transparent;
+}
+
+.console-dock-workspace .dv-tabs-container { align-items: center; gap: 4px; }
+
+/* The custom renderer supplies insets; Dockview must not add its own padding. */
+.console-dock-workspace .dv-tab {
+  height: 28px;
+  margin: 8px 0;
+  padding: 0;
+  overflow: hidden;
+  border: 0;
+  border-radius: var(--console-dock-control-radius);
+  font-size: 13px;
+  font-weight: 400;
+  cursor: grab;
+  transition: background-color 120ms ease, color 120ms ease, opacity 120ms ease;
+}
+
+.console-dock-workspace .dv-tab:active { cursor: grabbing; }
+.console-dock-workspace .dv-tab::before { display: none; }
+.console-dock-workspace .dv-tab:not(.dv-active-tab) { background: transparent; color: var(--muted-foreground-1); }
+.console-dock-workspace .dv-tab:not(.dv-active-tab):hover { background: var(--secondary); color: var(--foreground); }
+.console-dock-workspace .dv-tab.dv-active-tab { background: var(--secondary); color: var(--foreground); box-shadow: none; }
+
+.console-dock-tab {
+  display: flex;
+  align-items: center;
+  height: 100%;
+  gap: 6px;
+  padding: 0 4px 0 8px;
+  user-select: none;
+}
+.console-dock-tab:not(:has(button)) { padding-inline: 8px; }
+.console-dock-tab-icon { flex-shrink: 0; width: 14px; height: 14px; color: var(--muted-foreground-2); }
+.dv-active-tab .console-dock-tab-icon { color: var(--foreground); }
+.console-dock-tab-label {
+  min-width: 0;
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* Narrow strips: shorter labels truncate with an ellipsis instead of pushing the active tab out of view. */
+@media (max-width: 800px) {
+  .console-dock-workspace .dv-tab:not(:has(.console-dock-tab[data-solo])) .console-dock-tab-label { max-width: 120px; }
+}
+/* Sole chat in a group: quiet title header, no pill, no icon, no close button. Same 28px/44px geometry. */
+.console-dock-workspace .dv-tab:has(.console-dock-tab[data-solo]),
+.console-dock-workspace .dv-tab.dv-active-tab:has(.console-dock-tab[data-solo]),
+.console-dock-workspace .dv-tab:not(.dv-active-tab):has(.console-dock-tab[data-solo]):hover { height: 28px; background: transparent; color: var(--muted-foreground-1); font-size: 14px; font-weight: 500; transition-property: color; }
+.console-dock-workspace .dv-tab:has(.console-dock-tab[data-solo]):hover { color: var(--foreground); }
+.console-dock-workspace .dv-tab.dv-active-tab:has(.console-dock-tab[data-solo]) { color: var(--foreground); }
+.console-dock-tab[data-solo] { padding-inline: 8px; }
+.console-dock-tab[data-solo] .console-dock-tab-icon { display: none; }
+.console-dock-tab[data-solo] .console-dock-tab-label { max-width: min(480px, 60vw); }
+/* Close affordance: hidden until the tab is hovered, focused or active. */
+.console-dock-tab button { flex-shrink: 0; opacity: 0; color: var(--muted-foreground-1); }
+.dv-tab:is(:hover, :focus-within) .console-dock-tab button,
+.dv-active-tab .console-dock-tab button { opacity: 1; }
+.console-dock-tab button:is(:hover, :focus-visible) { color: var(--foreground); }
+
+.console-dock-workspace .dv-tabs-overflow-container,
+.console-dock-workspace .dv-tabs-overflow-dropdown-default,
+.console-dock-workspace .dv-context-menu { border-radius: var(--console-dock-menu-radius); }
+.console-dock-workspace .dv-tab--dragging,
+.console-dock-workspace .dv-tab-dragging { opacity: .45; }
+.console-dock-workspace .dv-tab-ghost-drag { border-radius: var(--console-dock-control-radius); background: var(--card); box-shadow: 0 0 0 1px var(--border-2); }
+.console-dock-workspace .dv-drop-target-selection { transition: opacity 140ms ease, background-color 140ms ease; }
+
+/* Hairline separators between split groups; the sash only widens the hit area. */
+.console-dock-workspace .dv-split-view-container.dv-separator-border > .dv-view-container > .dv-view:not(:first-child)::before { background-color: var(--border-1); }
+.console-dock-workspace .dv-sash { background: transparent !important; }
+.console-dock-workspace .dv-sash::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  margin: auto;
+  pointer-events: none;
+  background: transparent;
+  transition: background-color 100ms ease;
+}
+.console-dock-workspace .dv-horizontal > .dv-sash-container > .dv-sash:not(.dv-disabled) { cursor: col-resize; }
+.console-dock-workspace .dv-vertical > .dv-sash-container > .dv-sash:not(.dv-disabled) { cursor: row-resize; }
+.console-dock-workspace .dv-horizontal > .dv-sash-container > .dv-sash:not(.dv-disabled)::after { width: 2px; }
+.console-dock-workspace .dv-vertical > .dv-sash-container > .dv-sash:not(.dv-disabled)::after { height: 2px; }
+.console-dock-workspace .dv-sash:not(.dv-disabled):is(:hover, :active)::after { background: var(--ring); }
+
+/* FLIP transactions animate open/close/drop, never continuous sash movement. */
+.console-dock-closing-surface {
+  position: absolute;
+  z-index: 8;
+  pointer-events: none;
+  background: var(--workspace-panel);
+}
+
+@media (hover: none) {
+  .console-dock-tab button { opacity: 1; }
+}
+/* Chat actions belong to the tab bar, outside persistent content overlays. */
+.console-dock-actions { display:flex; align-items:center; height:100%; gap:4px; padding-inline:0 4px; pointer-events:auto; color:var(--muted-foreground-1); font-size:13px; }
+.console-dock-actions:empty { display:none; }
+
+/* The unsent composer is an action, not a second history tab. */
+.console-dock-workspace .dv-tab:has([data-empty-placeholder]) { display:none; }
+
+.console-chat-drop-preview { position:absolute; z-index:80; display:none; pointer-events:none; place-items:center; border:1px solid var(--ring); border-radius:var(--radius-control); background:color-mix(in srgb,var(--primary) 10%,transparent); color:var(--foreground); font-size:13px; backdrop-filter:blur(2px); }
+
+/* A brand-new, empty chat has no header strip (Capy's new-thread screen shows none). */
+.console-dock-workspace .dv-tabs-and-actions-container:has(.console-dock-tab[data-draft]) { display: none; }

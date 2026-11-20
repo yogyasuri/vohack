@@ -1,0 +1,44 @@
+---
+// Starlight 0.43 opens the mobile sidebar with the popover API; this keeps that
+// contract (no script needed) and only restyles the button with the tokens.
+import { Icon } from '@astrojs/starlight/components';
+---
+
+<button
+  popovertarget="starlight__sidebar"
+  class="docs-menu-button md:sl-hidden print:hidden"
+  aria-label={Astro.locals.t('menuButton.accessibleLabel')}
+>
+  <Icon name="bars" class="open-menu" />
+  <Icon name="close" class="close-menu" />
+</button>
+
+<style>
+  .docs-menu-button {
+    position: fixed;
+    top: calc((var(--sl-nav-height) - var(--sl-menu-button-size)) / 2);
+    inset-inline-end: var(--sl-nav-pad-x);
+    z-index: var(--sl-z-index-navbar);
+    display: grid;
+    place-items: center;
+    width: var(--sl-menu-button-size);
+    height: var(--sl-menu-button-size);
+    padding: 0;
+    border: 1px solid var(--border-2);
+    border-radius: var(--radius-control);
+    background: var(--button-secondary);
+    color: var(--foreground);
+    cursor: pointer;
+  }
+  .docs-menu-button :global(svg) { width: var(--icon-lg); height: var(--icon-lg); }
+  .docs-menu-button:has(~ :popover-open) { background: var(--button-secondary-hover); }
+  .docs-menu-button:has(~ :popover-open) :global(.open-menu),
+  .docs-menu-button:not(:has(~ :popover-open)) :global(.close-menu) { display: none; }
+  @media (min-width: 50rem) {
+    .docs-menu-button { display: none; }
+  }
+  :global(body:has(#starlight__sidebar:popover-open)) { overflow: hidden; }
+  @media (min-width: 50rem) {
+    :global(body:has(#starlight__sidebar:popover-open)) { overflow: auto; }
+  }
+</style>

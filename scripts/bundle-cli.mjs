@@ -1,0 +1,228 @@
+import { build } from "esbuild";
+import { execFileSync } from "node:child_process";
+import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync, copyFileSync } from "node:fs";
+import { join, dirname } from "node:path";
+import { resolveBuildSentryDsn } from "./built-in-sentry-dsn.mjs";
+import { resolveBuildPostHogKey } from "./built-in-posthog-key.mjs";
+
+const outdir = process.env.ZERO_BUNDLE_OUTDIR || "dist";
+
+// Build edition: `full` (default) bundles everything. `core` leaves the research
+// packs (identity/entragraph, adgraph, xnu-fuzz) out of the bundle; their CLI
+// commands print a pointer to the full edition instead (see
+// packages/cli/src/commands/research-pack.ts).
+const EDITION = process.env.ZERO_EDITION || "full";
+if (EDITION !== "full" && EDITION !== "core") {
+  throw new Error(`ZERO_EDITION must be "core" or "full" (got "${EDITION}")`);
+}
+const RESEARCH_PACK_DIST = /packages\/engine\/dist\/(?:identity|adgraph|xnu-fuzz)\/.*\.js$/;
+const researchPackExclusionPlugin = {
+  name: "exclude-research-packs",
+  setup(build) {
+    build.onResolve({ filter: /^@0\/engine\/(?:identity|adgraph|xnu-fuzz)$/ }, (args) => ({ path: args.path, external: true }));
+    // Engine-internal lazy imports of the same modules resolve to dist files; replace
+    // them with an empty module so none of that code lands in the bundle.
+    // The research adapter registry still imports xnu-fuzz statically; keep those four
+    // names resolvable as stubs that fail loudly if a core build ever reaches them.
+    build.onLoad({ filter: RESEARCH_PACK_DIST }, (args) => {
+      const stubbed = /\/xnu-fuzz\/index\.js$/.test(args.path)
+        ? ["TartVmLane", "enumerateTargetModelFromKext", "generateInputsForSelector", "makeRng"]
+        : [];
+      const contents = stubbed
+        .map((name) => `export const ${name} = function ${name}() { throw new Error("This command is part of the full edition (research pack: xnu-fuzz)."); };`)
+        .join("\n");
+      return { contents: contents || "export {};\n", loader: "js" };
+    });
+  },
+};
+
+rmSync(outdir, { force: true, recursive: true });
+mkdirSync(outdir, { recursive: true });
+
+// Read the version from the root package.json once. This is the single
+// source of truth for the published CLI's --version output. The version
+// gets injected into the bundle via esbuild's `define` so the runtime
+// constants.ts can pick it up without a runtime fs read. See
+// packages/engine/src/shared/constants.ts for the matching loader.
+const rootPkg = JSON.parse(readFileSync("package.json", "utf8"));
+const PKG_VERSION = rootPkg.version;
+
+function readBuildCommit() {
+  try {
+    return execFileSync("git", ["rev-parse", "HEAD"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+  } catch {
+    return process.env.GITHUB_SHA?.trim() ?? "";
+  }
+}
+
+const BUILD_COMMIT = readBuildCommit();
+
+// Optional release-only Sentry DSN. Unset/empty is fine; malformed throws here,
+// before any bundling, so a bad secret can never be embedded. Never logged.
+const BUILT_IN_SENTRY_DSN = resolveBuildSentryDsn();
+
+// Optional release-only PostHog project key (anonymous usage analytics). Same
+// rules as the DSN: unset/empty embeds nothing, malformed throws before bundling.
+const BUILT_IN_POSTHOG_KEY = resolveBuildPostHogKey();
+
+// The staged parser wrapper is real only while `bun-compile.sh` is building a
+// standalone executable. The JavaScript/npm bundle takes the source-mode branch,
+// so retain those unreachable requires without trying to resolve generated files.
+const releaseOnlyAddonPlugin = {
+  name: "external-release-only-addons",
+  setup(build) {
+    build.onResolve({ filter: /^\.\/tree-sitter-compiled\// }, (args) => ({
+      path: args.path,
+      external: true,
+    }));
+  },
+};
+
+const buildResult = await build({
+  metafile: true,
+  entryPoints: ["packages/cli/src/index.ts"],
+  outdir,
+  outExtension: { ".js": ".js" },
+  entryNames: "0",
+  chunkNames: "chunks/[name]-[hash]",
+  bundle: true,
+  format: "esm",
+  platform: "node",
+  target: "node18",
+  // Split command and browser-server modules into lazy chunks.
+  splitting: true,
+  banner: {
+    js: '#!/usr/bin/env node\nimport { createRequire as __0CreateRequire } from "node:module";\nconst require = __0CreateRequire(import.meta.url);',
+  },
+  external: [
+    // node-sqlite3-wasm ships a .wasm sidecar that is resolved relative to
+    // its own package dir at runtime; marking it external keeps that sidecar
+    // addressable via the installed node_modules tree instead of trying to
+    // inline it.
+    "node-sqlite3-wasm",
+    "drizzle-orm",
+    "drizzle-orm/*",
+    "playwright",
+    "playwright-core",
+    // tree-sitter and its C grammar load native .node bindings relative to
+    // their installed package directories. Bundling their CommonJS loaders
+    // into an ESM chunk removes __dirname and breaks even `0 --help`.
+    // Keep both packages intact and declare them in the dist runtime manifest.
+    "tree-sitter",
+    "tree-sitter-c",
+    // Direct native-addon requires exist only for Bun's standalone compiler.
+    // The JavaScript bundle defines that path off and leaves all `.node` imports
+    // external so esbuild never expects staged release-only assets.
+    "*.node",
+  ],
+  define: {
+    // Inject the root package.json version as a string literal so the
+    // bundled constants.ts picks it up without a runtime fs read. The
+    // unbundled source/test path falls back to a one-time fs read of
+    // the same root package.json.
+    __ZERO_VERSION__: JSON.stringify(PKG_VERSION),
+    __ZERO_RELEASE_CHANNEL__: JSON.stringify(process.env.ZERO_BUILD_RELEASE_CHANNEL === "beta" ? "beta" : "dev"),
+    // The JavaScript bundle ships tree-sitter as an external runtime dependency.
+    // Only `bun --compile` stages and embeds its native addons.
+    __ZERO_COMPILED_TARGET__: "undefined",
+    __ZERO_BUILD_COMMIT__: JSON.stringify(BUILD_COMMIT),
+    __ZERO_BUILT_IN_SENTRY_DSN__: JSON.stringify(BUILT_IN_SENTRY_DSN),
+    __ZERO_BUILT_IN_POSTHOG_KEY__: JSON.stringify(BUILT_IN_POSTHOG_KEY),
+    __ZERO_EDITION__: JSON.stringify(EDITION),
+  },
+  plugins: EDITION === "core" ? [releaseOnlyAddonPlugin, researchPackExclusionPlugin] : [releaseOnlyAddonPlugin],
+});
+
+// Keep renderer code outside the shipped command/browser-server graph.
+const rendererInputs = Object.keys(buildResult.metafile.inputs).filter(path => /node_modules\/(?:@opentui\/|react(?:-dom|-reconciler)?\/)/.test(path));
+if (rendererInputs.length) throw new Error(`Terminal renderer code entered the production CLI: ${rendererInputs.join(", ")}`);
+
+cpSync("packages/engine/src/templates/attacks", `${outdir}/attacks`, { recursive: true });
+cpSync("packages/web/dist", `${outdir}/dashboard`, { recursive: true });
+
+// JIT methodology skills: packages/engine/src/agent/skills/index.ts walks its own
+// module directory (`new URL(".", import.meta.url)`) for *.yaml and validates
+// each as a skill. esbuild lands that loader in `dist/chunks/`, so the walk
+// targets `dist/chunks/` — mirror the skills tree to `dist/chunks/agent/skills/`
+// so `list_skills`/`load_skill` (ZERO_FEATURE_JIT_SKILLS) find every pack in the
+// packaged binary, exactly as they do from source. Copy ONLY *.yaml: the loader
+// validates every yaml it walks as a skill, so a stray non-skill yaml under
+// chunks would hard-fail loading. There are no other yaml under dist/chunks/.
+const skillsSrc = "packages/engine/src/agent/skills";
+let skillYamlCopied = 0;
+const copySkillYaml = (relDir) => {
+  const absDir = join(skillsSrc, relDir);
+  for (const entry of readdirSync(absDir, { withFileTypes: true })) {
+    const rel = relDir ? `${relDir}/${entry.name}` : entry.name;
+    if (entry.isDirectory()) {
+      copySkillYaml(rel);
+    } else if (entry.name.endsWith(".yaml") || entry.name.endsWith(".yml")) {
+      const dest = `${outdir}/chunks/agent/skills/${rel}`;
+      mkdirSync(dirname(dest), { recursive: true });
+      copyFileSync(join(skillsSrc, rel), dest);
+      skillYamlCopied++;
+    }
+  }
+};
+copySkillYaml("");
+console.log(`Copied ${skillYamlCopied} skill YAML files → chunks/agent/skills/`);
+
+// Fix double shebang
+const bundlePath = `${outdir}/0.js`;
+const bundle = readFileSync(bundlePath, "utf8").replace(
+  "#!/usr/bin/env node\n#!/usr/bin/env node\n",
+  "#!/usr/bin/env node\n"
+);
+writeFileSync(bundlePath, bundle);
+
+// Offline replay uses the same real fixture without booting interactive 0 or
+// carrying a main-workbench admission/state grant into its sibling VM.
+copyFileSync(
+  "packages/engine/dist/verification-spec/cli-path-traversal-fixture.js",
+  `${outdir}/cli-path-traversal-fixture.js`,
+);
+
+// Write the runtime package.json for dist/ (no workspace: deps). dist/ is never
+// published to a registry: it ships in the container image and the native build.
+const publishPkg = {
+  name: rootPkg.name,
+  version: rootPkg.version,
+  private: true,
+  type: "module",
+  description: rootPkg.description,
+  bin: { "0": "0.js" },
+  // Bundle the patched parser and its peer grammar as real source so the install
+  // never fetches an unpatched peer or depends on an unavailable file: path.
+  // Both native install hooks stay enabled.
+  bundledDependencies: ["tree-sitter", "tree-sitter-c"],
+  license: rootPkg.license,
+  // Track the root engines so dist/ never drifts from the
+  // runtime we actually support (root is the source of truth: >=24.0.0).
+  engines: rootPkg.engines,
+  dependencies: {
+    "drizzle-orm": rootPkg.dependencies["drizzle-orm"],
+    "node-sqlite3-wasm": rootPkg.dependencies["node-sqlite3-wasm"],
+    "pdfkit": rootPkg.dependencies.pdfkit,
+    "playwright": rootPkg.dependencies.playwright,
+    "tree-sitter": rootPkg.dependencies["tree-sitter"],
+    "tree-sitter-c": rootPkg.dependencies["tree-sitter-c"],
+  },
+};
+writeFileSync(`${outdir}/package.json`, JSON.stringify(publishPkg, null, 2) + "\n");
+cpSync("vendor", `${outdir}/vendor`, { recursive: true });
+copyFileSync("scripts/dist-package-lock.json", `${outdir}/package-lock.json`);
+copyFileSync("LICENSE-APACHE", `${outdir}/LICENSE-APACHE`);
+copyFileSync("LICENSE-MIT", `${outdir}/LICENSE-MIT`);
+copyFileSync("README.md", `${outdir}/README.md`);
+
+console.log(`Bundled 0 v${rootPkg.version} → ${outdir}/`);
+
+// Include the optional worker demo workspace in dist/.
+for (const asset of ["README.md", "include/decoder.h", "src/decoder.c", "patched-decoder.c", "witness-65537x1.bin"]) {
+  const destination = `${outdir}/worker-assets/demo-target/${asset}`;
+  mkdirSync(dirname(destination), { recursive: true });
+  copyFileSync(`assets/worker-demo/demo-target/${asset}`, destination);
+}

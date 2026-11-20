@@ -1,0 +1,87 @@
+import { osecDB } from "@0/engine/storage";
+import type { Finding, ScanReport } from "@0/engine/shared";
+import { loadFindingFocus } from "../finding-focus.js";
+import { ciReportProvenance } from "../ci-report-provenance.js";
+class ReportArtifactError extends Error { constructor(message: string, readonly statusCode: number) { super(message); } }
+
+function summary(findings: Finding[], totalAttacks = 0): ScanReport["summary"] {
+  return { totalAttacks, totalFindings: findings.length, critical: findings.filter(f => f.severity === "critical").length,
+    high: findings.filter(f => f.severity === "high").length, medium: findings.filter(f => f.severity === "medium").length,
+    low: findings.filter(f => f.severity === "low").length, info: findings.filter(f => f.severity === "info").length };
+}
+/** An export with no findings in it: an empty list is a result, not an error. */
+export function emptyFindingSnapshot(): ScanReport {
+  return { target: "No findings", scanDepth: "default", startedAt: "", completedAt: "", durationMs: 0, findings: [], summary: summary([]), warnings: [] };
+}
+/** Legacy scan rows retain findings but may not retain the complete original report. */
+export function retainedScanSnapshot(scanId: string, dbPath?: string, original?: ScanReport): ScanReport {
+  const db = new osecDB(dbPath);
+  try {
+    const scan = db.getScan(scanId);
+    if (!scan) throw new ReportArtifactError("Scan not found.", 404);
+    // One malformed row (a model can send a truncated PoC) must not make the whole report unreadable.
+    const findings: Finding[] = [];
+    const unreadable: string[] = [];
+    for (const row of db.getFindings(scanId)) {
+      try { findings.push(loadFindingFocus(row.id, { dbPath }).finding); } catch { unreadable.push(row.id); }
+    }
+    const finish = (report: ScanReport): ScanReport => unreadable.length
+      ? { ...report, warnings: [...report.warnings, { stage: "report", message: `${unreadable.length} stored finding${unreadable.length === 1 ? "" : "s"} could not be read and ${unreadable.length === 1 ? "is" : "are"} not in this report: ${unreadable.join(", ")}.` }] }
+      : report;
+    if (original) return finish({ ...structuredClone(original), findings, summary: { ...original.summary, ...summary(findings, original.summary.totalAttacks) } });
+    let retained: Record<string, unknown> = {};
+    try { const value = JSON.parse(scan.summary ?? "{}"); if (value && typeof value === "object" && !Array.isArray(value)) retained = value; } catch { /* older summaries are not report documents */ }
+    if (ciReportProvenance(scan.summary) && retained.originalReport && typeof retained.originalReport === "object") {
+      const source = retained.originalReport as ScanReport;
+      return finish({
+        target: scan.target, scanDepth: scan.depth as ScanReport["scanDepth"],
+        startedAt: scan.startedAt, completedAt: scan.completedAt ?? "", durationMs: scan.durationMs ?? 0,
+        findings, summary: summary(findings, typeof source.summary?.totalAttacks === "number" ? source.summary.totalAttacks : 0),
+        warnings: [...(Array.isArray(source.warnings) ? source.warnings : []), { stage: "report", message: "Imported CI evidence. Source execution and verification claims have not been independently verified by this engine. Findings are retained as discovered; executable verification instructions were not imported." }],
+        executionSuccessful: false, exitReason: "partial",
+      });
+    }
+    return finish({
+      target: scan.target, scanDepth: ["quick", "default", "deep"].includes(scan.depth) ? scan.depth as ScanReport["scanDepth"] : "default",
+      startedAt: scan.startedAt, completedAt: scan.completedAt ?? "", durationMs: scan.durationMs ?? 0,
+      findings, summary: summary(findings, typeof retained.totalAttacks === "number" ? retained.totalAttacks : 0),
+      warnings: [{ stage: "report", message: "Export reconstructed from retained scan rows. The original report warnings and review checks were not retained in this legacy record." }],
+      ...(typeof retained.error === "string" ? { error: retained.error } : {}),
+      executionSuccessful: false, exitReason: scan.status === "cancelled" ? "cancelled" as const : "partial" as const,
+    });
+  } finally { db.close(); }
+}
+/** One evidence collection from findings that live in different run databases. */
+export function mergeFindingSnapshots(snapshots: ScanReport[]): ScanReport {
+  const findings = snapshots.flatMap(snapshot => snapshot.findings);
+  return {
+    target: "Selected findings from multiple runs", scanDepth: "default",
+    startedAt: snapshots.map(snapshot => snapshot.startedAt).filter(Boolean).sort()[0] ?? "", completedAt: snapshots.map(snapshot => snapshot.completedAt).sort().at(-1) ?? "",
+    durationMs: 0, findings, summary: summary(findings),
+    warnings: [{ stage: "report", message: "Selected findings export. This is an evidence collection, not a complete assessment report." }],
+    ...(snapshots.some(snapshot => snapshot.executionSuccessful === false) ? { executionSuccessful: false, exitReason: "partial" as const } : {}),
+  };
+}
+
+export function retainedFindingSnapshot(ids: string[], dbPath?: string): ScanReport {
+  if (!ids.length || ids.length > 500) throw new ReportArtifactError("Select between one and 500 findings to export.", 400);
+  const db = new osecDB(dbPath);
+  try {
+    const findings: Finding[] = [];
+    const scanIds = new Set<string>();
+    for (const id of new Set(ids)) {
+      const row = db.getFinding(id);
+      if (!row) throw new ReportArtifactError("A selected finding was not found in this engine.", 404);
+      scanIds.add(row.scanId);
+      findings.push(loadFindingFocus(id, { dbPath }).finding);
+    }
+    const scans = [...scanIds].map(id => db.getScan(id)).filter(scan => scan !== undefined);
+    return {
+      target: scans.length === 1 ? scans[0]!.target : "Selected findings from multiple runs", scanDepth: "default",
+      startedAt: scans.map(scan => scan!.startedAt).sort()[0] ?? "", completedAt: scans.map(scan => scan!.completedAt ?? "").sort().at(-1) ?? "",
+      durationMs: 0, findings, summary: summary(findings),
+      warnings: [{ stage: "report", message: "Selected findings export. This is an evidence collection, not a complete assessment report." }],
+      ...(scans.some(scan => scan!.status !== "completed") ? { executionSuccessful: false, exitReason: "partial" as const } : {}),
+    };
+  } finally { db.close(); }
+}

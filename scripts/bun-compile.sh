@@ -1,0 +1,143 @@
+#!/usr/bin/env bash
+# bun-compile.sh — produce a self-contained 0 binary via `bun build --compile`.
+#
+# Usage:
+#   scripts/bun-compile.sh                    # compile for the host platform
+#   scripts/bun-compile.sh bun-linux-x64      # cross-compile for a specific target
+#   scripts/bun-compile.sh bun-darwin-arm64 ./dist-bin/0-darwin-arm64
+#
+# Must be run from the repo root. Assumes pnpm install + pnpm -r build have
+# already run (workspace packages need their dist/ directories so Bun can
+# resolve @0/engine/shared etc.).
+#
+# Externals are chosen to match the runtime pattern in the source:
+#   - playwright / playwright-core / electron / chromium-bidi  — loaded via
+#     try/catch dynamic import in racing.ts / oracles.ts / egats.ts. Safe to
+#     skip at compile time; runtime gracefully degrades when absent.
+#   - node-sqlite3-wasm                                        — belt-and-
+#     suspenders pairing with the lazy `createRequire` in wasm-shim.ts. The
+#     Bun runtime always uses bun:sqlite via createBunEngine; the WASM
+#     branch is dead code in the compiled binary. Marking it external
+#     prevents Bun from baking node-sqlite3-wasm.wasm (and its absolute
+#     `__dirname` path) into the binary, which is what crashed v0.10.1
+#     with `ENOENT … node-sqlite3-wasm.wasm` on user machines.
+
+set -euo pipefail
+ROOT_DIR="$(pwd -P)"
+
+
+TARGET="${1:-}"
+OUTFILE="${2:-dist-bin/0}"
+
+mkdir -p "$(dirname "$OUTFILE")"
+
+if [ -n "$TARGET" ]; then
+  TARGET_ARG="--target=$TARGET"
+  NATIVE_TARGET="${TARGET#bun-}"
+  NATIVE_TARGET="${NATIVE_TARGET%-baseline}"
+  NATIVE_TARGET="${NATIVE_TARGET/windows-/win32-}"
+  # Append target suffix to default outfile if caller didn't override
+  if [ "$OUTFILE" = "dist-bin/0" ]; then
+    OUTFILE="dist-bin/0-${TARGET#bun-}"
+  fi
+else
+  TARGET_ARG=""
+  case "$(uname -s)-$(uname -m)" in
+    Linux-x86_64|Linux-amd64) NATIVE_TARGET="linux-x64" ;;
+    Linux-aarch64|Linux-arm64) NATIVE_TARGET="linux-arm64" ;;
+    Darwin-arm64) NATIVE_TARGET="darwin-arm64" ;;
+    Darwin-x86_64) NATIVE_TARGET="darwin-x64" ;;
+    MINGW*-x86_64|MSYS*-x86_64) NATIVE_TARGET="win32-x64" ;;
+    MINGW*-aarch64|MSYS*-aarch64) NATIVE_TARGET="win32-arm64" ;;
+    *) echo "Unsupported native target: $(uname -s)-$(uname -m)" >&2; exit 2 ;;
+  esac
+fi
+
+# Ship Linux x64's baseline variant so older CPUs and x64 container emulation
+# can start the CLI. Keep Windows native: the pinned compiler cannot extract
+# its Windows baseline runtime when compiling on a Windows runner.
+if [ -z "$TARGET" ]; then
+  case "$NATIVE_TARGET" in
+    linux-x64) TARGET_ARG="--target=bun-linux-x64-baseline" ;;
+  esac
+fi
+
+case "$NATIVE_TARGET" in
+  linux-x64|linux-arm64|darwin-arm64|darwin-x64|win32-x64|win32-arm64) ;;
+  *) echo "Unsupported compiled target: $NATIVE_TARGET" >&2; exit 2 ;;
+esac
+
+# Pull the version from the root package.json so `--version` on the
+# compiled binary reports the actual release instead of constants.ts's
+# fallback ("0.0.0-dev") — the fallback reads a package.json path that
+# isn't in the /$bunfs virtual tree.
+PKG_VERSION="$(node -p "require('./package.json').version")"
+BUILD_COMMIT="$(git rev-parse HEAD 2>/dev/null || printf '%s' "${GITHUB_SHA:-}")"
+RELEASE_CHANNEL="dev"
+if [ "${ZERO_BUILD_RELEASE_CHANNEL:-}" = "beta" ]; then RELEASE_CHANNEL="beta"; fi
+
+# Build edition: ZERO_EDITION=core|full (default full). `core` defines
+# __ZERO_EDITION__ so the research-pack commands (identity, entragraph, adgraph,
+# xnu-fuzz) print a full-edition notice, and marks their engine subpaths external.
+# NOTE: engine-internal relative imports of those modules (security-engines,
+# xnu-iokit-adapter) cannot be excluded through the `bun build` CLI, so the
+# compiled-binary saving is smaller than the esbuild bundle's (scripts/bundle-cli.mjs).
+EDITION="${ZERO_EDITION:-full}"
+case "$EDITION" in
+  full|core) ;;
+  *) echo "ZERO_EDITION must be core or full (got: $EDITION)" >&2; exit 2 ;;
+esac
+EDITION_EXTERNALS=()
+if [ "$EDITION" = "core" ]; then
+  EDITION_EXTERNALS=(--external @0/engine/identity --external @0/engine/adgraph --external @0/engine/xnu-fuzz)
+fi
+
+# `node-gyp-build` hides native addon paths behind a runtime lookup. Stage the
+# selected pair at fixed relative paths so c-dataflow's direct requires make Bun
+# embed them. The dashboard follows the same pattern: its Vite output is
+# generated into a temporary source module immediately before compilation, then
+# restored so ordinary source builds remain clean.
+STAGE_DIR="${ROOT_DIR}/packages/engine/dist/stages/tree-sitter-compiled"
+DASHBOARD_ASSET_FILE="${ROOT_DIR}/packages/cli/src/dashboard-assets.generated.ts"
+DASHBOARD_ASSET_BACKUP="$(mktemp)"
+cp "$DASHBOARD_ASSET_FILE" "$DASHBOARD_ASSET_BACKUP"
+cleanup() {
+  rm -rf "$STAGE_DIR"
+  if [ -f "$DASHBOARD_ASSET_BACKUP" ]; then
+    cp "$DASHBOARD_ASSET_BACKUP" "$DASHBOARD_ASSET_FILE"
+    rm -f "$DASHBOARD_ASSET_BACKUP"
+  fi
+}
+trap cleanup EXIT
+node scripts/stage-tree-sitter-native.mjs "$NATIVE_TARGET" "$STAGE_DIR"
+node packages/cli/scripts/generate-dashboard-assets.mjs \
+  "${ROOT_DIR}/packages/web/dist" \
+  "$DASHBOARD_ASSET_FILE"
+
+# Validated release DSN (empty when unprovisioned; malformed fails here). Not printed.
+BUILT_IN_SENTRY_DSN="$(node "${ROOT_DIR}/scripts/built-in-sentry-dsn.mjs")"
+# Validated release PostHog project key (same rules; not printed).
+BUILT_IN_POSTHOG_KEY="$(node "${ROOT_DIR}/scripts/built-in-posthog-key.mjs")"
+
+cd packages/cli
+
+bun build src/index.ts \
+  --compile \
+  ${TARGET_ARG} \
+  --outfile "../../$OUTFILE" \
+  --define "__ZERO_VERSION__=\"$PKG_VERSION\"" \
+  --define "__ZERO_RELEASE_CHANNEL__=\"$RELEASE_CHANNEL\"" \
+  --define "__ZERO_BUILD_COMMIT__=\"$BUILD_COMMIT\"" \
+  --define "__ZERO_COMPILED_TARGET__=\"$NATIVE_TARGET\"" \
+  --define "__ZERO_BUILT_IN_SENTRY_DSN__=\"$BUILT_IN_SENTRY_DSN\"" \
+  --define "__ZERO_BUILT_IN_POSTHOG_KEY__=\"$BUILT_IN_POSTHOG_KEY\"" \
+  --define "__ZERO_EDITION__=\"$EDITION\"" \
+  ${EDITION_EXTERNALS[@]+"${EDITION_EXTERNALS[@]}"} \
+  --external playwright \
+  --external playwright-core \
+  --external electron \
+  --external chromium-bidi \
+  --external node-sqlite3-wasm \
+  --external pdfkit
+
+echo "Built $OUTFILE (version $PKG_VERSION, edition $EDITION)"

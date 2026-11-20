@@ -1,0 +1,206 @@
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+
+import {
+  runConfigExport,
+  runConfigImport,
+  runConfigSet,
+  runConfigShow,
+  type ConfigCommandDeps,
+} from "../config.js";
+import {
+  DEFAULT_SETTINGS,
+  loadGlobalSettings,
+  readProjectOverrides,
+  saveSettings,
+} from "../../state/settings.js";
+
+const temp: string[] = [];
+function makeDir(prefix: string): string {
+  const dir = mkdtempSync(join(tmpdir(), prefix));
+  temp.push(dir);
+  return dir;
+}
+
+type ImportDeps = ConfigCommandDeps & { scope?: "global" | "project"; yes?: boolean; global?: boolean };
+function capture(): { deps: (extra?: Partial<ImportDeps>) => ImportDeps; out: string[]; err: string[] } {
+  const out: string[] = [];
+  const err: string[] = [];
+  return {
+    out,
+    err,
+    deps: (extra = {}) => ({ out: (l) => out.push(l), err: (l) => err.push(l), ...extra }),
+  };
+}
+
+beforeEach(() => {
+  process.exitCode = 0;
+});
+afterEach(() => {
+  process.exitCode = 0;
+  while (temp.length > 0) {
+    const dir = temp.pop();
+    if (dir) rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+describe("config show", () => {
+  it("labels each key with its source layer", () => {
+    const home = makeDir("cfg-home-");
+    const project = makeDir("cfg-proj-");
+    saveSettings({ ...DEFAULT_SETTINGS, autoCompaction: false }, home);
+    writeFileSync(join(project, ".0-tmp"), ""); // placeholder to keep dir
+    const cap = capture();
+    runConfigShow(cap.deps({ homeDir: home, projectDir: project }));
+    const text = cap.out.join("\n");
+    expect(text).toContain("autoCompaction");
+    expect(text).toContain("[global]");
+    expect(process.exitCode).toBe(0);
+  });
+});
+
+describe("config export", () => {
+  it("writes the effective config to a file", () => {
+    const home = makeDir("cfg-home-");
+    const project = makeDir("cfg-proj-");
+    saveSettings({ ...DEFAULT_SETTINGS, busyInputMode: "queue" }, home);
+    const file = join(makeDir("cfg-out-"), "cfg.json");
+    const cap = capture();
+    runConfigExport(file, cap.deps({ homeDir: home, projectDir: project }));
+    const parsed = JSON.parse(readFileSync(file, "utf8"));
+    expect(parsed.busyInputMode).toBe("queue");
+  });
+
+  it("prints to stdout when no file is given", () => {
+    const home = makeDir("cfg-home-");
+    const cap = capture();
+    runConfigExport(undefined, cap.deps({ homeDir: home, projectDir: makeDir("cfg-proj-") }));
+    expect(cap.out.join("\n")).toContain('"autoCompaction"');
+  });
+});
+
+describe("config import", () => {
+  it("rejects retired presentation settings without modifying existing legacy preferences", () => {
+    const home = makeDir("cfg-home-"); const project = makeDir("cfg-project-");
+    saveSettings({ ...DEFAULT_SETTINGS, density: "compact" }, home);
+    const before = loadGlobalSettings(home);
+    const file = join(makeDir("cfg-in-"), "legacy.json");
+    writeFileSync(file, JSON.stringify({ theme: "light", density: "comfortable", transcriptStyle: "bubble", autoCompaction: false }));
+    const cap = capture(); runConfigImport(file, cap.deps({ homeDir: home, projectDir: project }));
+    expect(process.exitCode).toBe(1);
+    expect(cap.err.join("\n")).toContain("Retired terminal settings");
+    expect(cap.err.join("\n")).toContain("web console");
+    expect(loadGlobalSettings(home)).toEqual(before);
+    const shown = capture(); runConfigShow(shown.deps({ homeDir: home, projectDir: project }));
+    expect(shown.out.join("\n")).not.toMatch(/theme|density|transcriptStyle/);
+    const exported = capture(); runConfigExport(undefined, exported.deps({ homeDir: home, projectDir: project }));
+    expect(exported.out.join("\n")).not.toMatch(/theme|density|transcriptStyle/);
+  });
+
+  it("merges recognised keys into the global layer and reports changes", () => {
+    const home = makeDir("cfg-home-");
+    const project = makeDir("cfg-proj-");
+    const file = join(makeDir("cfg-in-"), "shared.json");
+    writeFileSync(file, JSON.stringify({ autoCompaction: false, busyInputMode: "queue", bogusKey: 1 }));
+    const cap = capture();
+
+    runConfigImport(file, cap.deps({ homeDir: home, projectDir: project, scope: "global" }));
+    expect(process.exitCode).toBe(0);
+    expect(loadGlobalSettings(home).autoCompaction).toBe(false);
+    expect(loadGlobalSettings(home).busyInputMode).toBe("queue");
+    expect(cap.out.join("\n")).toMatch(/Skipped unknown\/invalid keys: bogusKey/);
+  });
+
+  it("imports into the project layer with --project (sparse)", () => {
+    const home = makeDir("cfg-home-");
+    const project = makeDir("cfg-proj-");
+    const file = join(makeDir("cfg-in-"), "shared.json");
+    writeFileSync(file, JSON.stringify({ autoCompaction: false }));
+    const cap = capture();
+
+    runConfigImport(file, cap.deps({ homeDir: home, projectDir: project, scope: "project" }));
+    expect(readProjectOverrides(project)).toEqual({ autoCompaction: false });
+    expect(loadGlobalSettings(home).autoCompaction).toBe(DEFAULT_SETTINGS.autoCompaction);
+  });
+
+  it("accepts a config-artifact wrapper ({kind:'config', config:{…}})", () => {
+    const home = makeDir("cfg-home-");
+    const file = join(makeDir("cfg-in-"), "artifact.json");
+    writeFileSync(file, JSON.stringify({ kind: "config", id: "x.y", config: { autoCompaction: false } }));
+    const cap = capture();
+    runConfigImport(file, cap.deps({ homeDir: home, projectDir: makeDir("cfg-proj-"), scope: "global" }));
+    expect(loadGlobalSettings(home).autoCompaction).toBe(false);
+  });
+
+  it("REFUSES to flip a security setting without --yes", () => {
+    const home = makeDir("cfg-home-");
+    const initialSettings = { ...DEFAULT_SETTINGS, allowSubagentOperatorMessaging: false };
+    saveSettings(initialSettings, home);
+    const project = makeDir("cfg-proj-");
+    const file = join(makeDir("cfg-in-"), "danger.json");
+    writeFileSync(file, JSON.stringify({ allowSubagentOperatorMessaging: true, autoCompaction: false }));
+    const cap = capture();
+
+    runConfigImport(file, cap.deps({ homeDir: home, projectDir: project, scope: "global", yes: false }));
+    expect(process.exitCode).toBe(1);
+    // Nothing was written — not even the safe key.
+    expect(loadGlobalSettings(home)).toEqual(initialSettings);
+  });
+
+  it("rejects retired unattended TUI lens toggles", () => {
+    const home = makeDir("cfg-home-");
+    const file = join(makeDir("cfg-in-"), "lens-evolution.json");
+    writeFileSync(file, JSON.stringify({
+      autoEvolveFinderLenses: true,
+      autoPromoteFinderLenses: true,
+    }));
+    const cap = capture();
+
+    runConfigImport(file, cap.deps({ homeDir: home, projectDir: makeDir("cfg-proj-"), scope: "global", yes: false }));
+    expect(process.exitCode).toBe(1);
+    expect(loadGlobalSettings(home)).toEqual(DEFAULT_SETTINGS);
+  });
+
+  it("applies a security flip only when --yes is passed", () => {
+    const home = makeDir("cfg-home-");
+    saveSettings({ ...DEFAULT_SETTINGS, allowSubagentOperatorMessaging: false }, home);
+    const file = join(makeDir("cfg-in-"), "danger.json");
+    writeFileSync(file, JSON.stringify({ allowSubagentOperatorMessaging: true }));
+    const cap = capture();
+
+    runConfigImport(file, cap.deps({ homeDir: home, projectDir: makeDir("cfg-proj-"), scope: "global", yes: true }));
+    expect(process.exitCode).toBe(0);
+    expect(loadGlobalSettings(home).allowSubagentOperatorMessaging).toBe(true);
+  });
+
+  it("requires explicit global approval to change the execution boundary and ignores project attempts", () => {
+    const home = makeDir("cfg-home-");
+    const project = makeDir("cfg-proj-");
+    const file = join(makeDir("cfg-in-"), "workbench.json");
+    const initial = { ...DEFAULT_SETTINGS, executionProfile: "smolvm" as const };
+    saveSettings(initial, home);
+    writeFileSync(file, JSON.stringify({ executionProfile: "local", autoCompaction: false }));
+    const cap = capture();
+    runConfigImport(file, cap.deps({ homeDir: home, projectDir: project, scope: "global" }));
+    expect(process.exitCode).toBe(1);
+    expect(loadGlobalSettings(home)).toEqual(initial);
+    runConfigImport(file, cap.deps({ homeDir: home, projectDir: project, scope: "project", yes: true }));
+    expect(readProjectOverrides(project)).toEqual({ autoCompaction: false });
+    expect(loadGlobalSettings(home).executionProfile).toBe("smolvm");
+    runConfigImport(file, cap.deps({ homeDir: home, projectDir: project, scope: "global", yes: true }));
+    expect(process.exitCode).toBe(0);
+    expect(loadGlobalSettings(home).executionProfile).toBe("local");
+  });
+
+  it("errors when the file has no recognised settings", () => {
+    const file = join(makeDir("cfg-in-"), "junk.json");
+    writeFileSync(file, JSON.stringify({ nope: 1 }));
+    const cap = capture();
+    runConfigImport(file, cap.deps({ homeDir: makeDir("cfg-home-"), projectDir: makeDir("cfg-proj-") }));
+    expect(process.exitCode).toBe(1);
+    expect(cap.err.join("\n")).toMatch(/no recognised settings/);
+  });
+});

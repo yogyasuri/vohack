@@ -1,0 +1,184 @@
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, describe, expect, it } from "vitest";
+
+import {
+  startCodexDeviceAuth,
+  type CodexDeviceAuthProcess,
+} from "./codex-device-auth.js";
+
+const directories: string[] = [];
+
+function temporaryHome(): string {
+  const home = mkdtempSync(join(tmpdir(), "0-codex-device-auth-"));
+  directories.push(home);
+  return home;
+}
+
+afterEach(() => {
+  for (const directory of directories.splice(0)) {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+function fakeProcess() {
+  let stdout: ((chunk: Buffer) => void) | undefined;
+  let stderr: ((chunk: Buffer) => void) | undefined;
+  let error: ((value: Error) => void) | undefined;
+  let close: ((code: number | null) => void) | undefined;
+  const kills: NodeJS.Signals[] = [];
+  const process: CodexDeviceAuthProcess = {
+    stdout: { on: (_event, listener) => { stdout = listener; } },
+    stderr: { on: (_event, listener) => { stderr = listener; } },
+    on: (event, listener) => {
+      if (event === "error") error = listener as (value: Error) => void;
+      if (event === "close") close = listener as (code: number | null) => void;
+    },
+    kill: (signal) => {
+      if (signal) kills.push(signal);
+      return true;
+    },
+  };
+  return {
+    process,
+    kills,
+    stdout: (text: string) => stdout?.(Buffer.from(text)),
+    stderr: (text: string) => stderr?.(Buffer.from(text)),
+    error: (value: Error) => error?.(value),
+    close: (code: number | null) => close?.(code),
+  };
+}
+
+describe("startCodexDeviceAuth", () => {
+  it("uses Codex device OAuth and replaces only stale in-process Codex tokens after success", () => {
+    const home = temporaryHome();
+    const authPath = join(home, "auth.json");
+    writeFileSync(authPath, JSON.stringify({
+      tokens: { access_token: "fresh-access", refresh_token: "fresh-refresh" },
+    }));
+    const env: NodeJS.ProcessEnv = {
+      "ZERO_CODEX_AUTH_JSON_PATH": authPath,
+      "ZERO_CHATGPT_ACCESS_TOKEN": "stale-access",
+      "ZERO_CHATGPT_OAUTH_REFRESH_TOKEN": "stale-refresh",
+    };
+    const child = fakeProcess();
+    const updates: string[] = [];
+    const opened: string[] = [];
+    let connected = 0;
+
+    startCodexDeviceAuth({
+      env,
+      homeDir: home,
+      probe: () => true,
+      openBrowser: (url) => { opened.push(url); },
+      spawn: (command, args) => {
+        expect(command).toBe("codex");
+        expect(args).toEqual(["login", "--device-auth"]);
+        return child.process;
+      },
+      onUpdate: (update) => updates.push(update.phase),
+      onConnected: () => { connected += 1; },
+    });
+    child.stdout("Open https://auth.openai.com/codex/device\n");
+    child.stderr("Enter code ABCD-EFGH\n");
+    child.close(0);
+
+    expect(opened).toEqual(["https://auth.openai.com/codex/device"]);
+
+    expect(env["ZERO_CHATGPT_ACCESS_TOKEN"]).toBe("fresh-access");
+    expect(env["ZERO_CHATGPT_OAUTH_REFRESH_TOKEN"]).toBe("fresh-refresh");
+    expect(updates).toEqual(["running", "running", "running", "connected"]);
+    expect(connected).toBe(1);
+  });
+
+  it("reports missing Codex before starting device sign-in", () => {
+    const updates: Array<{ phase: string; message: string }> = [];
+    let launched = false;
+
+    startCodexDeviceAuth({
+      env: { PATH: "/definitely-missing" },
+      spawn: () => {
+        launched = true;
+        return fakeProcess().process;
+      },
+      onUpdate: (update) => updates.push(update),
+      onConnected: () => {},
+    });
+
+    expect(launched).toBe(false);
+    expect(updates.map((update) => update.phase)).toEqual(["unavailable"]);
+  });
+
+  it("turns a launch ENOENT into setup guidance", () => {
+    const updates: Array<{ phase: string; message: string }> = [];
+    startCodexDeviceAuth({
+      env: {},
+      probe: () => true,
+      spawn: () => {
+        const error = new Error("spawn codex ENOENT") as NodeJS.ErrnoException;
+        error.code = "ENOENT";
+        throw error;
+      },
+      onUpdate: (update) => updates.push(update),
+      onConnected: () => {},
+    });
+
+    expect(updates.map((update) => update.phase)).toEqual(["unavailable"]);
+  });
+
+  it("opens the browser when Codex emits the device URL without a newline", () => {
+    const child = fakeProcess();
+    const opened: string[] = [];
+    startCodexDeviceAuth({
+      env: {},
+      probe: () => true,
+      openBrowser: (url) => { opened.push(url); },
+      spawn: () => child.process,
+      onUpdate: () => {},
+      onConnected: () => {},
+    });
+
+    child.stdout("https://auth.openai.com/codex/device?user_code=ABCD");
+
+    expect(opened).toEqual(["https://auth.openai.com/codex/device?user_code=ABCD"]);
+  });
+
+  it("keeps a launch error terminal when the child later closes successfully", () => {
+    const child = fakeProcess();
+    const phases: string[] = [];
+    let connected = 0;
+    startCodexDeviceAuth({
+      env: { ZERO_CHATGPT_ACCESS_TOKEN: "stale-access" },
+      probe: () => true,
+      spawn: () => child.process,
+      onUpdate: (update) => phases.push(update.phase),
+      onConnected: () => { connected += 1; },
+    });
+    const error = new Error("spawn codex ENOENT") as NodeJS.ErrnoException;
+    error.code = "ENOENT";
+    child.error(error);
+    child.close(0);
+    child.stdout("late output");
+
+    expect(phases).toEqual(["running", "unavailable"]);
+    expect(connected).toBe(0);
+  });
+
+  it("cancels the device flow without treating it as an API-key failure", () => {
+    const child = fakeProcess();
+    const phases: string[] = [];
+    const session = startCodexDeviceAuth({
+      env: {},
+      probe: () => true,
+      spawn: () => child.process,
+      onUpdate: (update) => phases.push(update.phase),
+      onConnected: () => {},
+    });
+    session.cancel();
+    child.close(null);
+
+    expect(child.kills).toEqual(["SIGTERM"]);
+    expect(phases.at(-1)).toBe("cancelled");
+  });
+});

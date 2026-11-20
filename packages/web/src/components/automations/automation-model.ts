@@ -1,0 +1,192 @@
+import type { SecurityWorkflow, SecurityWorkflowExecution, SecurityWorkflowInput } from "@0/engine/shared";
+import { DEFAULT_SECURITY_WORKFLOW_PLAN } from "@0/engine/shared/security-workflows";
+
+/** Pure view models for the Automations list and detail form. No React, no network. */
+
+export type Cadence = "hourly" | "daily" | "weekly";
+export type ScheduleSummary = { id: string; workflowId: string; workflowRevision: number; enabled: boolean; cadence: Cadence; startAt?: string; nextFireAt: string; timezone: string; lastStatus?: string; lastError?: string };
+export type ExecutionSummary = Pick<SecurityWorkflowExecution, "id" | "workflowId" | "status" | "createdAt" | "updatedAt">;
+
+const pad = (value: number) => String(value).padStart(2, "0");
+
+function zonedParts(iso: string, timezone: string): { weekday: string; hour: string; minute: string; zone: string } | null {
+  const date = new Date(iso);
+  if (!Number.isFinite(date.getTime())) return null;
+  try {
+    const parts = new Intl.DateTimeFormat("en-US", { timeZone: timezone || "UTC", weekday: "short", hour: "2-digit", minute: "2-digit", hourCycle: "h23", timeZoneName: "short" }).formatToParts(date);
+    const get = (type: string) => parts.find(part => part.type === type)?.value ?? "";
+    return { weekday: get("weekday"), hour: get("hour"), minute: get("minute"), zone: get("timeZoneName") };
+  } catch { return null; }
+}
+
+/** "Hourly at :30", "Daily 09:00 UTC", "Weekly Mon 09:00 UTC". Falls back to the cadence alone. */
+export function scheduleSummaryLabel(schedule: Pick<ScheduleSummary, "cadence" | "startAt" | "nextFireAt" | "timezone">): string {
+  const parts = zonedParts(schedule.startAt ?? schedule.nextFireAt, schedule.timezone);
+  if (!parts) return { hourly: "Hourly", daily: "Daily", weekly: "Weekly" }[schedule.cadence];
+  if (schedule.cadence === "hourly") return `Hourly at :${parts.minute}`;
+  if (schedule.cadence === "daily") return `Daily ${parts.hour}:${parts.minute} ${parts.zone}`;
+  return `Weekly ${parts.weekday} ${parts.hour}:${parts.minute} ${parts.zone}`;
+}
+
+export function triggerSummaryLabel(schedules: readonly ScheduleSummary[]): string {
+  if (!schedules.length) return "Manual";
+  const active = schedules.filter(schedule => schedule.enabled);
+  const shown = active.length ? active : schedules;
+  if (shown.length > 1) return `${shown.length} schedules`;
+  const label = scheduleSummaryLabel(shown[0]!);
+  return active.length ? label : `${label} (paused)`;
+}
+
+export function relativeAge(iso: string | undefined, now: number): string {
+  if (!iso) return "Never";
+  const time = new Date(iso).getTime();
+  if (!Number.isFinite(time)) return "Never";
+  const seconds = Math.max(0, Math.round((now - time) / 1000));
+  if (seconds < 60) return "just now";
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 48) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  if (days < 60) return `${days}d ago`;
+  return `${Math.floor(days / 30)}mo ago`;
+}
+
+export function relativeUntil(iso: string | undefined, now: number): string {
+  if (!iso) return "-";
+  const time = new Date(iso).getTime();
+  if (!Number.isFinite(time)) return "-";
+  const seconds = Math.round((time - now) / 1000);
+  if (seconds <= 60) return "soon";
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `in ${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 48) return `in ${hours}h`;
+  return `in ${Math.floor(hours / 24)}d`;
+}
+
+export function executionDurationMs(execution: Pick<ExecutionSummary, "createdAt" | "updatedAt">): number | null {
+  const start = new Date(execution.createdAt).getTime();
+  const end = new Date(execution.updatedAt).getTime();
+  return Number.isFinite(start) && Number.isFinite(end) && end >= start ? end - start : null;
+}
+
+export function formatDuration(ms: number | null): string {
+  if (ms === null) return "-";
+  const seconds = Math.round(ms / 1000);
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ${pad(seconds % 60)}s`;
+  return `${Math.floor(minutes / 60)}h ${pad(minutes % 60)}m`;
+}
+
+export type AutomationRow = {
+  id: string; name: string; target: string; steps: number; trigger: string; enabled: boolean; scheduled: boolean;
+  lastRunAt?: string; lastStatus?: string; nextFireAt?: string; updatedAt: string;
+};
+
+export function automationRows(definitions: readonly SecurityWorkflow[], schedules: readonly ScheduleSummary[], executions: readonly ExecutionSummary[] = []): AutomationRow[] {
+  const latest = new Map<string, ExecutionSummary>();
+  for (const execution of executions) {
+    const current = latest.get(execution.workflowId);
+    if (!current || execution.createdAt > current.createdAt) latest.set(execution.workflowId, execution);
+  }
+  return definitions.map(definition => {
+    const own = schedules.filter(schedule => schedule.workflowId === definition.id);
+    const active = own.filter(schedule => schedule.enabled);
+    const next = [...active].sort((a, b) => a.nextFireAt.localeCompare(b.nextFireAt))[0];
+    const last = latest.get(definition.id);
+    return {
+      id: definition.id, name: definition.name, target: definition.target, steps: definition.nodes.filter(node => node.type !== "trigger" && node.type !== "report").length,
+      trigger: triggerSummaryLabel(own), enabled: active.length > 0, scheduled: own.length > 0,
+      ...(last ? { lastRunAt: last.createdAt, lastStatus: last.status } : {}), ...(next ? { nextFireAt: next.nextFireAt } : {}), updatedAt: definition.updatedAt,
+    };
+  });
+}
+
+/** Most recently run first, then most recently edited. */
+export function sortAutomationRows(rows: readonly AutomationRow[]): AutomationRow[] {
+  return [...rows].sort((a, b) => (b.lastRunAt ?? "").localeCompare(a.lastRunAt ?? "") || b.updatedAt.localeCompare(a.updatedAt));
+}
+
+export function filterAutomationRows(rows: readonly AutomationRow[], query: string): AutomationRow[] {
+  const terms = query.trim().toLowerCase().split(/\s+/).filter(Boolean);
+  if (!terms.length) return [...rows];
+  return rows.filter(row => { const haystack = `${row.name} ${row.target} ${row.trigger}`.toLowerCase(); return terms.every(term => haystack.includes(term)); });
+}
+
+export type TemplateLike = { id: string; name: string; description: string; category: string; starter?: { aliases: readonly string[] } };
+export function filterTemplates<T extends TemplateLike>(templates: readonly T[], query: string): T[] {
+  const terms = query.trim().toLowerCase().split(/\s+/).filter(Boolean);
+  return templates.filter(item => { const haystack = `${item.name} ${item.description} ${item.category} ${item.starter?.aliases.join(" ") ?? ""}`.toLowerCase(); return terms.every(term => haystack.includes(term)); });
+}
+
+/** Minimal valid definition: manual trigger, one review step, result collection. */
+export function blankAutomationInput(overrides: { name?: string; instructions?: string; target?: string } = {}): SecurityWorkflowInput {
+  return {
+    name: (overrides.name ?? "").trim() || "Untitled automation", instructions: overrides.instructions ?? "", target: overrides.target ?? "",
+    nodes: [
+      { id: "start", type: "trigger", label: "Start manually", enabled: true },
+      { id: "review", type: "audit", label: "Review", enabled: true, plan: { ...DEFAULT_SECURITY_WORKFLOW_PLAN } },
+      { id: "report", type: "report", label: "Collect results", enabled: true },
+    ],
+    edges: [{ source: "start", target: "review" }, { source: "review", target: "report" }],
+  };
+}
+
+export function duplicateName(name: string, existing: readonly string[] = []): string {
+  const stem = name.replace(/\s+copy(?: \d+)?$/i, "");
+  const taken = new Set(existing.map(item => item.toLowerCase()));
+  let candidate = `${stem} copy`;
+  for (let index = 2; taken.has(candidate.toLowerCase()); index += 1) candidate = `${stem} copy ${index}`;
+  return candidate.length > 160 ? candidate.slice(-160) : candidate;
+}
+
+/** Plain wording for a failed run's raw error. Anything unrecognised is passed through. */
+export function executionErrorText(error: string): string {
+  const missing = /ENOENT[^']*'([^']+)'/.exec(error);
+  if (missing) return `The folder "${missing[1]}" was not found on this computer.`;
+  if (/EACCES/.test(error)) return "This computer cannot read the folder. Check its permissions.";
+  return error;
+}
+
+/** Inline validation for the editable header fields. Empty object means valid. */
+export function validateAutomationDraft(draft: { name: string }): { name?: string } {
+  return draft.name.trim() ? {} : { name: "Name is required" };
+}
+
+/** Model and reasoning choices on the automation form. An empty value means the Computer's current selection. */
+export const AUTOMATION_REASONING_OPTIONS = [
+  { value: "", label: "Default" }, { value: "low", label: "Low" }, { value: "medium", label: "Medium" },
+  { value: "high", label: "High" }, { value: "xhigh", label: "Very high" }, { value: "max", label: "Maximum" },
+] as const;
+const MODEL_SEPARATOR = "\u0000";
+export const encodeAutomationModel = (model: { providerId: string; model: string } | null | undefined): string => model ? `${model.providerId}${MODEL_SEPARATOR}${model.model}` : "";
+export function decodeAutomationModel(value: string): { providerId: string; model: string } | null {
+  const at = value.indexOf(MODEL_SEPARATOR);
+  return at < 0 ? null : { providerId: value.slice(0, at), model: value.slice(at + 1) };
+}
+/** The saved choice stays selectable even if the catalog no longer lists it. */
+export function automationModelOptions(rows: readonly { value: string; label: string }[], saved: { providerId: string; model: string } | null | undefined): { value: string; label: string }[] {
+  const options = [{ value: "", label: "Default" }, ...rows];
+  const value = encodeAutomationModel(saved);
+  return value && !options.some(option => option.value === value) ? [...options, { value, label: saved!.model }] : options;
+}
+/** Combine a model and effort pick into the stored field. No model and no effort clears it. */
+export function automationModelChoice(modelValue: string, reasoning: string, saved: { providerId: string; model: string } | null | undefined): { providerId: string; model: string; reasoning?: string } | null {
+  const picked = decodeAutomationModel(modelValue) ?? (reasoning ? saved ?? null : null);
+  return picked ? { ...picked, ...(reasoning ? { reasoning } : {}) } : null;
+}
+/** Runtime selection a manual run starts its Mission with. Undefined keeps the Computer's selection. */
+export function automationRuntime(model: SecurityWorkflow["model"]): { providerId: string; model: string; reasoningEffort?: string } | undefined {
+  return model ? { providerId: model.providerId, model: model.model, ...(model.reasoning ? { reasoningEffort: model.reasoning } : {}) } : undefined;
+}
+
+/** Where a run's status dot sits: green when it finished, red when it failed, none before the first run. */
+export function runStatusTone(status: string | undefined): "success" | "danger" | "warning" | undefined {
+  if (!status) return undefined;
+  if (status === "completed" || status === "succeeded") return "success";
+  if (status === "failed" || status === "error" || status === "interrupted") return "danger";
+  if (status === "blocked" || status === "needs_review" || status === "cancelled") return "warning";
+  return undefined;
+}

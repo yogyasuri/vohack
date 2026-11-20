@@ -1,0 +1,328 @@
+/**
+ * A live, process-wide store for the interactive console's display settings.
+ *
+ * The problem it solves: every TUI screen used to read settings with
+ * `useState(() => loadSettings())` — a snapshot frozen at mount. A change made
+ * in the settings screen only reached another screen when that screen was
+ * unmounted and remounted, which is both a lie (the change was "saved" but the
+ * chat kept its stale copy) and a bug waiting to surface the moment chat stops
+ * being torn down on navigation. This module is the single source of truth:
+ * the settings screen writes it, and every screen subscribes to it, so a
+ * change re-renders every consumer synchronously with no remount.
+ *
+ * It owns no persistence or validation of its own. `settings.ts` already holds
+ * the total `normalizeSettings`, the never-throwing layered `loadSettings`, and
+ * the report-by-return-value `saveSettings`; this is a thin, subscribable cache
+ * in front of them. Two contracts inherited from that module carry through here:
+ * nothing throws on an I/O failure (a read-only `$HOME` is an inconvenience,
+ * not a lost session), and a failed save still takes effect in memory so the
+ * UI reflects the operator's choice — it just reports `false`.
+ *
+ * ── Two-level configuration ──────────────────────────────────────────────────
+ *
+ * Reads resolve the GLOBAL file (`~/.0/tui-settings.json`) with a per-project
+ * OVERRIDE (`<cwd>/.0/tui-settings.json`) layered on top, per key, falling
+ * through to the built-in defaults. This happens automatically on the load path
+ * (`getSettings`/`reloadSettings`) — no bootstrap wiring is needed anywhere.
+ *
+ * Writes target a LAYER. `updateSetting` writes to the PROJECT file when a
+ * project override file already exists, or when the caller passes
+ * `scope: "project"`; otherwise it writes the GLOBAL file. `setSettings` (the
+ * whole-object write the settings screen uses) always writes the global base.
+ * The provenance of every effective value is exposed via `getSettingSources` so
+ * `0 config get` can label each key default/global/project.
+ */
+
+import {
+  ANALYTICS_LEVEL_ENV,
+  configureSubagentLimits,
+  analyticsPipeline,
+  analyticsOptedOut,
+  levelAtLeast,
+  resolveAnalyticsLevel,
+} from "@0/engine";
+
+import {
+  SETTING_DEFS,
+  isOperatorSetting,
+  loadGlobalSettings,
+  loadLayeredSettings,
+  normalizeSettings,
+  projectSettingsExist,
+  readProjectOverrides,
+  resolveLayeredSettings,
+  saveSettings,
+  saveProjectOverrides,
+  type LayeredSettings,
+  type SettingLayer,
+  type TuiSettings,
+} from "./settings.js";
+
+type Subscriber = (settings: TuiSettings) => void;
+
+/**
+ * The one cached value for the whole process. `null` until the first read, so
+ * the disk hit is lazy — a session that never opens settings never loads them
+ * eagerly, and tests can point the store at a temp home before it reads. Holds
+ * the effective settings AND their per-key provenance together, so both stay in
+ * lock-step through every swap.
+ */
+let cached: LayeredSettings | null = null;
+let globalDraft: TuiSettings | null = null;
+let projectDraft: Partial<TuiSettings> | null = null;
+
+/**
+ * Directories passed through to the load/save paths. Both undefined in
+ * production (home defaults to the real home; project defaults to the process
+ * cwd inside `settings.ts`); set via `configureSettingsStore` for a custom
+ * `--home`/project and by tests to redirect the files into temp dirs.
+ */
+let homeDir: string | undefined;
+let projectDir: string | undefined;
+
+const subscribers = new Set<Subscriber>();
+
+/**
+ * Fan a new value out to every subscriber, fail-soft. A throwing subscriber
+ * must not break the others or the setter that triggered the notify — the same
+ * contract the diagnostics channel and the output guard hold in this codebase.
+ * Iterate a snapshot of the set so a subscriber that unsubscribes (or a new one
+ * that subscribes) from inside its own callback cannot corrupt the walk.
+ */
+function notify(settings: TuiSettings): void {
+  bridgeAnalyticsLevel(settings);
+  bridgeSubagentLimits(settings);
+  for (const fn of [...subscribers]) {
+    try {
+      fn(settings);
+    } catch {
+      // A broken consumer is its own problem; the store stays consistent.
+    }
+  }
+}
+
+function loadLayered(): LayeredSettings {
+  return globalDraft === null && projectDraft === null
+    ? loadLayeredSettings({ homeDir, projectDir })
+    : resolveLayeredSettings(globalDraft ?? loadGlobalSettings(homeDir), projectDraft ?? readProjectOverrides(projectDir));
+}
+
+/**
+ * The current settings, always a complete and valid object. The first call
+ * lazily loads (and layers) from disk; every later call returns the cached
+ * reference unchanged until a write replaces it, which is what keeps
+ * `useSyncExternalStore` from tearing or looping.
+ */
+export function getSettings(): TuiSettings {
+  if (cached === null) {
+    cached = loadLayered();
+    bridgeAnalyticsLevel(cached.settings);
+    bridgeSubagentLimits(cached.settings);
+  }
+  return cached.settings;
+}
+
+/**
+ * Per-key provenance for the currently effective settings: which layer
+ * (default/global/project) each value came from. Lazily loads like `getSettings`.
+ */
+export function getSettingSources(): Record<keyof TuiSettings, SettingLayer> {
+  getSettings();
+  return cached!.sources;
+}
+
+/**
+ * Highlight an optional setup choice without changing the saved preference or
+ * enabling the pipeline. An inherited value written by this store is not a
+ * shell preference; an explicit shell refusal or hard opt-out still wins.
+ */
+export function getAnalyticsSetupDraft(): TuiSettings["analyticsLevel"] {
+  const settings = getSettings();
+  const current = process.env[ANALYTICS_LEVEL_ENV];
+  const shellPreference = current !== undefined && current !== bridgedAnalyticsEnv;
+  if (analyticsOptedOut() || (shellPreference && resolveAnalyticsLevel() === "off")) return "off";
+  return cached!.sources.analyticsLevel === "default" ? "usage" : settings.analyticsLevel;
+}
+
+/**
+ * Replace the whole settings object: persist it to the GLOBAL base, update
+ * memory, and notify every subscriber synchronously. Returns whether the save
+ * succeeded; a failure still updates memory and notifies (so the change is live
+ * for the session) and only the return value tells the caller it did not reach
+ * disk.
+ *
+ * The value is normalised on the way in so the in-memory copy is as valid as one
+ * freshly loaded. Use `updateSetting` for per-key changes: passing an effective
+ * project-layer snapshot here would promote unrelated overrides.
+ */
+export function setSettings(next: TuiSettings): boolean {
+  const value = normalizeSettings(next);
+  const saved = saveSettings(value, homeDir);
+  // Retain failed global writes without promoting the project layer.
+  globalDraft = saved ? null : value;
+  cached = loadLayered();
+  notify(cached.settings);
+  return saved;
+}
+
+
+/**
+ * Which layer a plain `updateSetting` (no explicit scope) would write to: the
+ * project file when a project override already exists, otherwise the global base.
+ */
+export function defaultWriteLayer(): Exclude<SettingLayer, "default"> {
+  return projectSettingsExist(projectDir) ? "project" : "global";
+}
+
+/**
+ * Change one key and persist to the correct layer, then re-derive the effective
+ * view and notify. Returns the save result, same reporting contract as
+ * `setSettings`.
+ *
+ * Target layer: `opts.scope` when given; otherwise `defaultWriteLayer()` — the
+ * project file if one exists, else global. A project write is SPARSE (only the
+ * changed key is added to the override, the rest keep falling through); a global
+ * write goes through the full-object `saveSettings`. An out-of-range value is
+ * coerced back to a default by the sanitiser/normaliser, never persisted raw.
+ */
+export function updateSetting<K extends keyof TuiSettings>(
+  key: K,
+  value: TuiSettings[K],
+  opts: { scope?: Exclude<SettingLayer, "default"> } = {},
+): boolean {
+  const operatorOnly = isOperatorSetting(key);
+  if (operatorOnly && opts.scope === "project") return false;
+  const layer = operatorOnly ? "global" : opts.scope ?? defaultWriteLayer();
+
+  if (layer === "global") {
+    return setSettings({ ...(globalDraft ?? loadGlobalSettings(homeDir)), [key]: value });
+  }
+
+  // Keep failed sparse writes across later edits in either layer.
+  const patch = { ...(projectDraft ?? readProjectOverrides(projectDir)), [key]: value };
+  const saved = saveProjectOverrides(patch, projectDir);
+  projectDraft = saved ? null : patch;
+  cached = loadLayered();
+  notify(cached.settings);
+  return saved;
+}
+
+/** Reset only visible selected settings, removing their project shadows. */
+export function resetSettings(next: TuiSettings, keys: readonly (keyof TuiSettings)[]): boolean {
+  const selected = keys.filter((key) => SETTING_DEFS.some((def) => def.key === key));
+  if (selected.length === 0) return true;
+  const global: Record<string, unknown> = { ...(globalDraft ?? loadGlobalSettings(homeDir)) };
+  const project = { ...(projectDraft ?? readProjectOverrides(projectDir)) };
+  let projectChanged = false;
+  for (const key of selected) {
+    global[key] = next[key];
+    if (Object.hasOwn(project, key)) {
+      delete project[key];
+      projectChanged = true;
+    }
+  }
+  const value = normalizeSettings(global);
+  const globalSaved = saveSettings(value, homeDir);
+  globalDraft = globalSaved ? null : value;
+  const projectSaved = !projectChanged || saveProjectOverrides(project, projectDir);
+  if (projectChanged) projectDraft = projectSaved ? null : project;
+  cached = loadLayered();
+  notify(cached.settings);
+  return globalSaved && projectSaved;
+}
+
+/**
+ * Preview a single setting IN MEMORY ONLY: update the cached value and notify
+ * subscribers WITHOUT writing to disk. For live UI preview (e.g. a picker
+ * repainting as you arrow through choices). NOT durable — revert
+ * with `reloadSettings()` (restores disk truth) or persist with `updateSetting`.
+ */
+export function previewSetting<K extends keyof TuiSettings>(key: K, value: TuiSettings[K]): void {
+  if (cached === null) cached = loadLayered();
+  cached = { settings: { ...cached.settings, [key]: value }, sources: cached.sources };
+  notify(cached.settings);
+}
+
+/**
+ * Subscribe to settings changes. Returns an unsubscribe function; calling it
+ * more than once is harmless. Subscribers fire synchronously inside
+ * `setSettings`/`updateSetting`/`reloadSettings`, never on a plain read.
+ */
+export function subscribeSettings(fn: Subscriber): () => void {
+  subscribers.add(fn);
+  return () => {
+    subscribers.delete(fn);
+  };
+}
+
+/** Hand the effective subagent limits to the engine; ZERO_SUBAGENT_* env vars still override them there. */
+function bridgeSubagentLimits(settings: TuiSettings): void {
+  configureSubagentLimits({ concurrency: settings.subagentConcurrency, maxDepth: settings.subagentMaxDepth, fanOut: settings.subagentFanOut });
+}
+
+// Preserve explicit environment restrictions. Only replace an env value this
+// bridge wrote itself, so child processes inherit live operator preferences
+// without turning a shell-level opt-out back on.
+let bridgedAnalyticsEnv: string | undefined;
+function bridgeAnalyticsLevel(settings: TuiSettings): void {
+  try {
+    const current = process.env[ANALYTICS_LEVEL_ENV];
+    if (current === undefined || current === bridgedAnalyticsEnv) {
+      process.env[ANALYTICS_LEVEL_ENV] = settings.analyticsLevel;
+      bridgedAnalyticsEnv = settings.analyticsLevel;
+    } else {
+      bridgedAnalyticsEnv = undefined;
+    }
+    const environmentLevel = resolveAnalyticsLevel();
+    analyticsPipeline.setLevel(levelAtLeast(environmentLevel, settings.analyticsLevel)
+      ? settings.analyticsLevel
+      : environmentLevel);
+  } catch {
+    // Never let telemetry wiring break a settings write.
+  }
+}
+
+/**
+ * Re-read both layers and notify — for when a settings file was edited by hand
+ * or by another process while a session is open. Replaces the cached value
+ * unconditionally, so the next `getSettings` and every subscriber see disk.
+ */
+export function reloadSettings(): TuiSettings {
+  globalDraft = null;
+  projectDraft = null;
+  cached = loadLayered();
+  notify(cached.settings);
+  return cached.settings;
+}
+
+/**
+ * Point the store at specific home/project directories and reload. Production
+ * leaves this alone (the real home and cwd are the defaults); it exists for a
+ * custom `--home`/project at startup and for tests that redirect the files into
+ * temp dirs. Reloading eagerly means a call made after subscribers exist
+ * notifies them of the swap.
+ */
+export function configureSettingsStore(options: { homeDir?: string; projectDir?: string }): void {
+  homeDir = options.homeDir;
+  projectDir = options.projectDir;
+  reloadSettings();
+}
+
+/**
+ * Drop all cached state and subscribers. Test-only: the store is a process
+ * singleton, so each test must start from a clean slate.
+ */
+export function __resetSettingsStoreForTests(): void {
+  cached = null;
+  globalDraft = null;
+  projectDraft = null;
+  homeDir = undefined;
+  projectDir = undefined;
+  subscribers.clear();
+  if (bridgedAnalyticsEnv !== undefined && process.env[ANALYTICS_LEVEL_ENV] === bridgedAnalyticsEnv) {
+    delete process.env[ANALYTICS_LEVEL_ENV];
+  }
+  bridgedAnalyticsEnv = undefined;
+  analyticsPipeline.setLevel("off");
+}
+

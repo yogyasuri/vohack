@@ -1,0 +1,43 @@
+import { describe, expect, it } from "vitest";
+import {
+  reduceWorkerTelemetry,
+  resolveContextLimit,
+  selectConversationContext,
+  type WorkerTelemetry,
+} from "./context-window.js";
+import type { SubagentMessagePayload } from "@0/engine";
+
+describe("resolveContextLimit — connected providers", () => {
+  const loadModels = () => ({
+    source: "synced",
+    models: [
+      { id: "gpt-5.5", provider: "openai", contextTokens: 200_000 },
+      { id: "gpt-5.5", provider: "azure", contextTokens: 300_000 },
+    ],
+  });
+
+  it("uses the active provider's exact catalog window when model IDs overlap", () => {
+    expect(resolveContextLimit({ modelId: "gpt-5.5", providerId: "azure" }, { loadModels }))
+      .toEqual({ tokens: 300_000, source: "synced-catalog" });
+    expect(resolveContextLimit({ modelId: "gpt-5.5", providerId: "openai" }, { loadModels }))
+      .toEqual({ tokens: 200_000, source: "synced-catalog" });
+  });
+
+  it("never guesses a window without a running provider", () => {
+    expect(resolveContextLimit({ modelId: "gpt-5.5", providerId: undefined }, { loadModels })).toBeNull();
+  });
+
+  it("keeps a fractional context limit unknown instead of reporting a zero-token window", () => {
+    expect(resolveContextLimit(
+      { modelId: "future-model", providerId: "openai" },
+      { loadModels: () => ({ source: "synced", models: [{ id: "future-model", provider: "openai", contextTokens: 0.5 }] }) },
+    )).toBeNull();
+  });
+});
+
+const messageBase = {
+  agent_id: "worker-a",
+  parent_scan_id: "parent",
+  turn: 1,
+  ts: 1,
+} satisfies SubagentMessagePayload;

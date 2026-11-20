@@ -1,0 +1,95 @@
+import { mkdirSync, mkdtempSync, realpathSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { tmpdir } from "node:os";
+import { describe, expect, it, vi } from "vitest";
+import { checkSourceDistFreshness } from "./source-freshness.js";
+
+const OLD = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const HEAD = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+function makeRepo(): { repoRoot: string; bundlePath: string } {
+  const repoRoot = mkdtempSync(join(tmpdir(), "0-freshness-"));
+  mkdirSync(join(repoRoot, ".git"));
+  mkdirSync(join(repoRoot, "dist"));
+  const bundlePath = join(repoRoot, "dist", "0.js");
+  writeFileSync(bundlePath, "#!/usr/bin/env node\n");
+  return { repoRoot: realpathSync(repoRoot), bundlePath: realpathSync(bundlePath) };
+}
+
+describe("source dist freshness guard", () => {
+  it("allows standalone startup without resolving the virtual executable path", () => {
+    vi.stubGlobal("__ZERO_COMPILED_TARGET__", "darwin-arm64");
+    try {
+      const result = checkSourceDistFreshness({
+        entryPath: "/$bunfs/root/0",
+        buildCommit: HEAD,
+        execGit: () => { throw new Error("Standalone startup must not query a checkout"); },
+      });
+      expect(result.checked).toBe(false);
+      expect(result.stale).toBe(false);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("reports stale root dist bundles in a source checkout", () => {
+    const { repoRoot, bundlePath } = makeRepo();
+    const result = checkSourceDistFreshness({
+      entryPath: bundlePath,
+      buildCommit: OLD,
+      execGit: (_cwd, args) => {
+        if (args.join(" ") === "rev-parse --show-toplevel") return repoRoot;
+        if (args.join(" ") === "rev-parse HEAD") return HEAD;
+        throw new Error("unexpected git args");
+      },
+    });
+
+    expect(result.checked).toBe(true);
+    expect(result.stale).toBe(true);
+  });
+
+  it("accepts matching build and HEAD commits", () => {
+    const { repoRoot, bundlePath } = makeRepo();
+    const result = checkSourceDistFreshness({
+      entryPath: bundlePath,
+      buildCommit: HEAD,
+      execGit: (_cwd, args) => {
+        if (args.join(" ") === "rev-parse --show-toplevel") return repoRoot;
+        if (args.join(" ") === "rev-parse HEAD") return HEAD;
+        throw new Error("unexpected git args");
+      },
+    });
+
+    expect(result.checked).toBe(true);
+    expect(result.stale).toBe(false);
+  });
+
+  it("skips explicit bypasses and non-root dist paths", () => {
+    const { bundlePath } = makeRepo();
+    const bypassed = checkSourceDistFreshness({
+      entryPath: bundlePath,
+      buildCommit: OLD,
+      env: { "ZERO_ALLOW_STALE_SOURCE_DIST": "1" },
+    });
+    expect(bypassed.reason).toBe("bypassed");
+
+    const otherBundlePath = join(dirname(bundlePath), "not-0.js");
+    writeFileSync(otherBundlePath, "#!/usr/bin/env node\n");
+    const nonRootDist = checkSourceDistFreshness({
+      entryPath: otherBundlePath,
+      buildCommit: OLD,
+    });
+    expect(nonRootDist.reason).toBe("not-root-dist-bundle");
+  });
+
+  it("skips when the bundle has no embedded commit", () => {
+    const { bundlePath } = makeRepo();
+    const result = checkSourceDistFreshness({
+      entryPath: bundlePath,
+      buildCommit: "",
+    });
+
+    expect(result.reason).toBe("missing-build-commit");
+    expect(result.stale).toBe(false);
+  });
+});

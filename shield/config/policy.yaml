@@ -1,0 +1,46 @@
+# Voyege policy store (PDF Part B §4A, plane 3). The safety gate reads this at start-up.
+# Changes must go through review; block is the default for anything not listed.
+scope:
+  allowed_hosts:
+    - staging.tbo.test
+    - api.staging.tbo.test
+  denied_path_prefixes:          # never reachable by agents, whatever the tier
+    - /__control
+    - /admin/delete
+  out_of_scope_report_only: true # DNS/CT discoveries outside scope are reported, never contacted
+
+budgets:
+  global_rps: 10                 # one global request budget shared by all workers
+  per_host_rps: 5
+  max_response_bytes: 262144     # minimum evidence: cap response size
+  max_records_per_list: 5        # cap records kept from list endpoints
+  money:
+    max_synthetic_bookings_per_hour: 20
+    max_synthetic_value_inr_per_run: 200000
+
+backoff:
+  latency_multiplier: 2.0        # p95 > 2x baseline -> halve rate
+  error_rate: 0.02               # 5xx > 2% -> halve rate
+  pause_after_seconds: 60        # persists 60 s -> pause all
+  out_of_scope_blocks_per_hour_to_pause: 3
+
+tiers:                           # L0 look only, L1 read altered, L2 change+undo, L3 money
+  L0: {methods: [GET, HEAD], approval: auto}
+  L1: {methods: [GET, HEAD], approval: auto}
+  L2: {methods: [GET, HEAD, POST, PUT, PATCH], approval: auto, requires_cleanup: true}
+  L3: {methods: [GET, HEAD, POST, PUT, PATCH, DELETE], approval: standing_within_budget,
+       concurrency_approval: per_batch, requires_cleanup: true}
+
+approvals:
+  expire_minutes: 60
+  hold_severities: [Critical, High]   # no Critical/High ticket leaves until a person confirms
+
+webhook:
+  secret_env: VOYEGE_WEBHOOK_SECRET
+  dedupe_seconds: 120
+
+inventory:
+  zombie_days: 30
+  zombie_days_low_frequency: 90
+  ownership_confidence_threshold: 0.6
+  own_traffic_markers: {header: X-Voyege-Test, account_prefix: "vtest-"}

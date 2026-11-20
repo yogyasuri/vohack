@@ -1,0 +1,58 @@
+import { useEffect, useRef } from "react";
+import { PageHeader, usePageVariant } from "@/components/page-shell";
+import { Navigate, useLocation } from "react-router-dom";
+import { CapyApiKeyIcon, CapyChipIcon, CapyGaugeIcon, CapyInboxIcon, CapySettingsIcon, CapyTerminalSparkleIcon } from "@/ui/icons/capy";
+import { ConnectionsControl, ModelsControl } from "@/components/console-control/connections-control";
+import { SettingsControl } from "@/components/console-control/settings-control";
+import { settingsPageId, settingsPages, settingsRedirect } from "@/components/console-control/settings-index";
+import { DoctorControl, ProjectControl, ToolsControl } from "@/components/console-control/system-control";
+
+export type WebConsoleControlMode = "connections" | "models" | "settings" | "doctor" | "tools" | "project";
+
+const pages = [
+  { mode: "connections", path: "/connections", label: "Models", icon: CapyApiKeyIcon, description: "" },
+  { mode: "models", path: "/models", label: "Models", icon: CapyChipIcon, description: "" },
+  { mode: "project", path: "/project", label: "Folder", icon: CapyInboxIcon, description: "" },
+  { mode: "settings", path: "/settings", label: "Settings", icon: CapySettingsIcon, description: "" },
+  { mode: "doctor", path: "/doctor", label: "Diagnostics", icon: CapyGaugeIcon, description: "" },
+  { mode: "tools", path: "/tools", label: "Tools", icon: CapyTerminalSparkleIcon, description: "" },
+] as const;
+
+export function WebConsoleControlsPage({ mode: passedMode }: { mode?: WebConsoleControlMode }) {
+  const location = useLocation();
+  const headingRef = useRef<HTMLElement>(null);
+  const leaf = location.pathname.replace(/^\/console\//, "/").replace(/\/$/, "");
+  const mode = passedMode ?? pages.find(page => page.path === leaf)?.mode ?? "settings";
+  const page = pages.find(item => item.mode === mode)!;
+  const params = new URLSearchParams(location.search);
+  const sessionId = params.get("session") ?? undefined;
+  const category = settingsPageId(params.get("section"));
+  const redirect = mode === "settings" ? settingsRedirect(params.get("section")) : undefined;
+
+  // Appearance has a grid of themes and backgrounds, so it takes the wider column.
+  usePageVariant(mode === "settings" && category === "appearance" ? "list" : undefined);
+  useEffect(() => { if (!location.hash) headingRef.current?.focus(); }, [mode, category, location.hash]);
+  // Connections and Models are one page; old links keep working.
+  if (mode === "connections") return <Navigate replace to={{ pathname: "/models", search: location.search, hash: location.hash }} />;
+  if (redirect) {
+    // A removed or merged section: keep the session and return context, drop the old section name.
+    const next = new URLSearchParams(location.search); next.delete("section");
+    const [path, own] = redirect.split("?");
+    const merged = new URLSearchParams(own); next.forEach((value, key) => { if (!merged.has(key)) merged.set(key, value); });
+    const keep = path === "/settings" || path.startsWith("/skills") ? `?${merged}` : "";
+    return <Navigate replace to={{ pathname: path, search: keep, hash: location.hash }} />;
+  }
+
+  const content = mode === "models" ? <><ConnectionsControl /><ModelsControl sessionId={sessionId} /></>
+    : mode === "settings" ? <SettingsControl category={category} />
+    : mode === "doctor" ? <DoctorControl />
+    : mode === "tools" ? <ToolsControl sessionId={sessionId} />
+    : <ProjectControl />;
+
+  const title = mode === "settings" ? settingsPages.find(item => item.id === category)!.label : page.label;
+  const subtitle = mode === "settings" && category === "shortcuts" ? undefined : mode === "settings" ? undefined : page.description || undefined;
+  return <div className="flex min-w-0 flex-col gap-10">
+    <PageHeader ref={headingRef} tabIndex={-1} className="outline-none" title={title} summary={subtitle} />
+    <section className="flex min-w-0 flex-col gap-10" aria-label={mode === "settings" ? `${title} settings` : page.label}>{content}</section>
+  </div>;
+}

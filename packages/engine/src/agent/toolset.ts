@@ -1,0 +1,107 @@
+/**
+ * Core toolset: the small default tool list the model sees, and the tool packs
+ * that skills can add on demand. See docs/design/core-toolset.md and
+ * docs/design/tool-philosophy.md.
+ *
+ * This module only decides what is ADVERTISED. It never grants authority: the
+ * set it is applied to has already passed role, scope, feature-flag and access
+ * gating (`getToolsForRole`), and every call still passes the same dispatch
+ * gates (scope, approvals) whichever list the model saw.
+ */
+import type { ToolDefinition } from "./types.js";
+
+export type Toolset = "core" | "full";
+
+/**
+ * The model-visible default: a shell, file read and edit, findings, a way to ask the
+ * operator, skills, web search and visual cards. `memory` is added per session.
+ */
+export const CORE_TOOL_NAMES: readonly string[] = [
+  "bash",
+  "str_replace",
+  "finding",
+  "ask_operator",
+  "load_skill",
+  "web_search",
+  "spawn_agent",
+];
+
+/**
+ * Packs: named groups of existing tool definitions that load only when a loaded
+ * skill declares them (`tools: [pack]` in skill frontmatter). A pack holds the
+ * canonical name for each capability; the aliases below stay dispatchable.
+ */
+export const TOOL_PACKS: Readonly<Record<string, readonly string[]>> = Object.freeze({});
+
+/**
+ * Old name -> canonical name. Aliases stay registered and dispatchable so stored
+ * sessions, saved workflows and skills keep working, but they are never
+ * advertised by a pack or by the core list.
+ */
+export const TOOL_ALIASES: Readonly<Record<string, string>> = Object.freeze({});
+
+export function canonicalToolName(name: string): string {
+  return TOOL_ALIASES[name] ?? name;
+}
+
+/** `core` and `pack:<name>` are accepted spellings (docs/design/skills-as-the-unit.md) next to the bare pack name. */
+export function normalizePackRef(raw: string): string {
+  const ref = raw.trim();
+  return ref.startsWith("pack:") ? ref.slice("pack:".length) : ref;
+}
+
+/** Whether a skill `tools:` entry names `core` or a known pack. */
+export function isKnownPackRef(raw: unknown): boolean {
+  if (typeof raw !== "string") return false;
+  const ref = normalizePackRef(raw);
+  return ref === "core" || Object.hasOwn(TOOL_PACKS, ref);
+}
+
+/** Tool names a pack list resolves to; unknown packs are returned separately. */
+export function resolvePacks(packs: readonly string[] | undefined): { tools: string[]; unknown: string[] } {
+  const tools = new Set<string>();
+  const unknown: string[] = [];
+  for (const raw of packs ?? []) {
+    const pack = typeof raw === "string" ? normalizePackRef(raw) : "";
+    if (!pack || pack === "core") continue;
+    const members = TOOL_PACKS[pack];
+    if (!members) { unknown.push(pack); continue; }
+    for (const name of members) tools.add(name);
+  }
+  return { tools: [...tools], unknown };
+}
+
+/** Every tool a pack can provide. */
+export function packToolNames(): Set<string> {
+  return new Set(Object.values(TOOL_PACKS).flat());
+}
+
+/** The resolved toolset: explicit choice, then ZERO_TOOLSET, then the surface default. */
+export function resolveToolset(options: { explicit?: string; surfaceDefault: Toolset; env?: NodeJS.ProcessEnv }): Toolset {
+  for (const value of [options.explicit, (options.env ?? process.env).ZERO_TOOLSET]) {
+    const v = typeof value === "string" ? value.trim().toLowerCase() : "";
+    if (v === "core" || v === "full") return v;
+  }
+  return options.surfaceDefault;
+}
+
+/** Split an already-authorized tool list into what stays advertised and what only packs can add. */
+/**
+ * Offered on top of the core list only when the session has Memory on (the host adds the definition
+ * only then). The shell cannot stand in for it: notes live outside the workspace, and a sandboxed thread has no access to the notes directory.
+ */
+export const SESSION_TOOL_NAMES: readonly string[] = ["memory"];
+
+export function partitionForToolset(defs: readonly ToolDefinition[], toolset: Toolset): { advertised: ToolDefinition[]; packOnly: ToolDefinition[] } {
+  if (toolset === "full") return { advertised: [...defs], packOnly: [] };
+  const core = new Set([...CORE_TOOL_NAMES, ...SESSION_TOOL_NAMES]);
+  const packed = packToolNames();
+  const advertised: ToolDefinition[] = [];
+  const packOnly: ToolDefinition[] = [];
+  for (const def of defs) {
+    if (core.has(def.name)) advertised.push(def);
+    else if (packed.has(def.name)) packOnly.push(def);
+    // Anything else (aliases, injected tools) is not part of the core list.
+  }
+  return { advertised, packOnly };
+}
